@@ -9,6 +9,9 @@ Artisan::command('inspire', function () {
 
 use Illuminate\Support\Facades\Schedule;
 
-Schedule::command('projects:check-health')->everyThirtySeconds();
+Schedule::command('projects:check-health')
+    ->everyThirtySeconds()
+    ->withoutOverlapping(5)
+    ->runInBackground();
 Schedule::command('model:prune')->daily();
 Schedule::command('laraowl:update --check')->daily();

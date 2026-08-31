@@ -7,6 +7,8 @@ use App\Models\Project;
 use App\Services\AlertService;
 use App\Services\IntegrationService;
 use Illuminate\Console\Command;
+use Illuminate\Http\Client\Pool;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 
 class CheckProjectUptime extends Command
@@ -28,27 +30,30 @@ class CheckProjectUptime extends Command
     /**
      * Execute the console command.
      */
-    public function handle(AlertService $alertService)
-    {
-        // 1. Check Uptime
-        $this->performUptimeChecks($alertService);
+    /**
+     * Maximum number of uptime requests in flight at the same time.
+     */
+    protected const CONCURRENCY = 25;
 
-        // 2. Check Heartbeats
+    /**
+     * Execute the console command.
+     *
+     * The scheduler runs this command every 30 seconds, so a single run only
+     * performs one round of checks and must finish well within that window.
+     */
+    public function handle(AlertService $alertService): int
+    {
+        $this->performUptimeChecks($alertService);
         $this->checkHeartbeats($alertService);
 
-        // 3. Support sub-minute intervals (30s)
-        if (Project::withUptimeMonitoring()->where('uptime_check_interval', '<', 60)->exists()) {
-            $this->info('Waiting 30 seconds for next sub-minute check...');
-            sleep(30);
-            $this->performUptimeChecks($alertService);
-        }
-
         $this->info('Health checks completed.');
+
+        return self::SUCCESS;
     }
 
-    protected function performUptimeChecks(AlertService $alertService)
+    protected function performUptimeChecks(AlertService $alertService): void
     {
-        $projects = Project::withUptimeMonitoring()->get()->filter(function ($project) {
+        $projects = Project::withUptimeMonitoring()->get()->filter(function (Project $project) {
             if (is_null($project->last_uptime_check_at)) {
                 return true;
             }
@@ -56,30 +61,36 @@ class CheckProjectUptime extends Command
             return $project->last_uptime_check_at->addSeconds($project->uptime_check_interval)->isPast();
         });
 
-        foreach ($projects as $project) {
-            $this->checkUptime($project, $alertService);
+        foreach ($projects->chunk(self::CONCURRENCY) as $batch) {
+            $batch = $batch->values();
+            $start = microtime(true);
+
+            $responses = Http::pool(fn (Pool $pool) => $batch->map(
+                fn (Project $project) => $pool->retry(2, 1000, throw: false)->timeout(10)->get($project->url)
+            )->all());
+
+            foreach ($batch as $index => $project) {
+                $this->recordUptimeResult($project, $responses[$index], $start, $alertService);
+            }
         }
     }
 
-    protected function checkUptime(Project $project, AlertService $alertService)
+    protected function recordUptimeResult(Project $project, Response|\Throwable $response, float $start, AlertService $alertService): void
     {
-        $start = microtime(true);
         $status = 'up';
         $statusCode = 0;
         $error = null;
 
-        try {
-            $response = Http::retry(2, 1000, throw: false)->timeout(10)->get($project->url);
+        if ($response instanceof \Throwable) {
+            $status = 'down';
+            $error = $response->getMessage();
+        } else {
             $statusCode = $response->status();
 
             if ($response->failed()) {
                 $status = 'down';
                 $error = "HTTP error status: {$statusCode}";
             }
-        } catch (\Exception $e) {
-            $status = 'down';
-            $error = $e->getMessage();
-            $statusCode = 0;
         }
 
         $responseTime = round((microtime(true) - $start) * 1000); // in ms
@@ -114,7 +125,7 @@ class CheckProjectUptime extends Command
         }
     }
 
-    protected function checkHeartbeats(AlertService $alertService)
+    protected function checkHeartbeats(AlertService $alertService): void
     {
         $failingHeartbeats = Heartbeat::where('status', 'active')
             ->get()
@@ -127,7 +138,7 @@ class CheckProjectUptime extends Command
         }
     }
 
-    protected function notifyRecovery(Project $project, AlertService $alertService)
+    protected function notifyRecovery(Project $project, AlertService $alertService): void
     {
         $rules = $project->alertRules()
             ->where('event_type', 'uptime_down')

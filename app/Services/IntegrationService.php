@@ -113,7 +113,7 @@ class IntegrationService
             ];
         }
 
-        Http::post($webhookUrl, ['blocks' => $blocks]);
+        Http::timeout(10)->post($webhookUrl, ['blocks' => $blocks]);
     }
 
     protected function sendToDiscord(Integration $integration, string $title, string $message, array $fields = [], ?string $url = null): void
@@ -128,7 +128,7 @@ class IntegrationService
             $discordFields[] = ['name' => $label, 'value' => (string) $value, 'inline' => true];
         }
 
-        Http::post($webhookUrl, [
+        Http::timeout(10)->post($webhookUrl, [
             'embeds' => [[
                 'title' => $title,
                 'description' => $message,
@@ -157,7 +157,7 @@ class IntegrationService
             $text .= "[View Details]({$url})";
         }
 
-        Http::post("https://api.telegram.org/bot{$botToken}/sendMessage", [
+        Http::timeout(10)->post("https://api.telegram.org/bot{$botToken}/sendMessage", [
             'chat_id' => $chatId,
             'text' => $text,
             'parse_mode' => 'Markdown',
@@ -171,7 +171,7 @@ class IntegrationService
             return;
         }
 
-        Http::post($webhookUrl, [
+        Http::timeout(10)->post($webhookUrl, [
             'event' => 'laraowl.alert',
             'title' => $title,
             'message' => $message,
