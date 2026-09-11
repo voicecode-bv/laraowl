@@ -6,6 +6,7 @@ use App\Events\ProjectDataIngested;
 use App\Models\Issue;
 use App\Models\Project;
 use App\Models\Record;
+use App\Models\RecordRollup;
 use App\Models\Threshold;
 use Illuminate\Support\Facades\DB;
 
@@ -40,6 +41,7 @@ class IngestService
 
         DB::transaction(function () use ($project, $records) {
             $batch = [];
+            $exceptions = 0;
 
             foreach ($records as $data) {
                 $type = $data['t'] ?? null;
@@ -66,6 +68,7 @@ class IngestService
                 ];
 
                 if ($type === 'exception') {
+                    $exceptions++;
                     $this->handleException($project, $record);
                 }
 
@@ -96,7 +99,14 @@ class IngestService
 
                 $this->checkThresholds($project, $record);
             }
+
             $this->rollupWriter->record($project, $batch);
+
+            // After the rollups, so the batch that just arrived is counted,
+            // and once for the batch rather than once per exception in it.
+            if ($exceptions > 0) {
+                $this->detectErrorSpike($project);
+            }
         });
 
         ProjectDataIngested::dispatch($project);
@@ -196,7 +206,7 @@ class IngestService
     }
 
     /**
-     * Group exceptions into unique issues based on hash and detect spikes.
+     * Group exceptions into unique issues based on hash.
      */
     protected function handleException(Project $project, Record $record): void
     {
@@ -220,23 +230,33 @@ class IngestService
         $record->update(['issue_id' => $issue->id]);
 
         $this->alertService->notifyNewIssue($issue);
-
-        // Detect Spike
-        $this->detectErrorSpike($project);
     }
 
     /**
      * Detect sudden surge in errors.
+     *
+     * Counted off the rollups, which already hold one row per minute per
+     * type: the window is a handful of small rows on the
+     * `(project_id, type, bucket)` index instead of a `COUNT(*)` over every
+     * exception the project recorded in it. That matters most exactly when
+     * this fires — during a storm, where counting the raw rows grows more
+     * expensive with each error it is trying to detect.
+     *
+     * Because the rollups are bucketed per minute, the window starts at the
+     * top of its first minute and so can reach up to a minute further back
+     * than the raw count did. For "N errors in the last few minutes" that is
+     * the same question.
      */
     protected function detectErrorSpike(Project $project): void
     {
         $windowMinutes = $project->settings['spike_window'] ?? 5;
         $threshold = $project->settings['spike_threshold'] ?? 50;
 
-        $count = $project->records()
+        $count = (int) RecordRollup::query()
+            ->where('project_id', $project->id)
             ->where('type', 'exception')
-            ->where('created_at', '>=', now()->subMinutes($windowMinutes))
-            ->count();
+            ->where('bucket', '>=', now()->subMinutes($windowMinutes)->startOfMinute())
+            ->sum('count');
 
         if ($count >= $threshold) {
             // Avoid spamming - only alert once every window
