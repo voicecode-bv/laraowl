@@ -16,8 +16,8 @@ import {
     Cpu,
     Database,
 } from 'lucide-react';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { atomDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { CodeBlock } from '@/components/code-block';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -201,7 +201,7 @@ export default function IssueShow({
                                                 </span>
                                             </div>
                                             <CardContent className="p-0">
-                                                <SyntaxHighlighter
+                                                <CodeBlock
                                                     language="php"
                                                     style={atomDark}
                                                     customStyle={{
@@ -218,7 +218,9 @@ export default function IssueShow({
                                                         (frame.line || 1) - 5,
                                                     )}
                                                     wrapLines={true}
-                                                    lineProps={(lineNum) => {
+                                                    lineProps={(
+                                                        lineNum: number,
+                                                    ) => {
                                                         const style: any = {
                                                             display: 'block',
                                                         };
@@ -238,7 +240,7 @@ export default function IssueShow({
                                                 >
                                                     {frame.snippet ||
                                                         '// No code snippet available'}
-                                                </SyntaxHighlighter>
+                                                </CodeBlock>
                                             </CardContent>
                                         </Card>
                                     ))}
@@ -250,7 +252,7 @@ export default function IssueShow({
                     <section>
                         <Card className="overflow-hidden border-border bg-black shadow-2xl">
                             <CardContent className="p-0">
-                                <SyntaxHighlighter
+                                <CodeBlock
                                     language="json"
                                     style={atomDark}
                                     customStyle={{
@@ -262,7 +264,7 @@ export default function IssueShow({
                                     }}
                                 >
                                     {JSON.stringify(payload, null, 4)}
-                                </SyntaxHighlighter>
+                                </CodeBlock>
                             </CardContent>
                         </Card>
                     </section>

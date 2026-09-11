@@ -10,8 +10,8 @@ import {
     ChevronRight,
 } from 'lucide-react';
 import { useState } from 'react';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { CodeBlock } from '@/components/code-block';
 import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
 import {
@@ -378,7 +378,7 @@ export default function RecordShow({
                                     }
 
                                     return (
-                                        <SyntaxHighlighter
+                                        <CodeBlock
                                             language="json"
                                             style={vscDarkPlus}
                                             customStyle={{
@@ -394,7 +394,7 @@ export default function RecordShow({
                                                 null,
                                                 4,
                                             )}
-                                        </SyntaxHighlighter>
+                                        </CodeBlock>
                                     );
                                 })()}
                             </div>
@@ -447,7 +447,7 @@ export default function RecordShow({
                                 </CollapsibleTrigger>
                                 <CollapsibleContent>
                                     <div className="border-t border-border p-6 text-xs">
-                                        <SyntaxHighlighter
+                                        <CodeBlock
                                             language="json"
                                             style={vscDarkPlus}
                                             customStyle={{
@@ -461,7 +461,7 @@ export default function RecordShow({
                                             {typeof body === 'string'
                                                 ? body
                                                 : JSON.stringify(body, null, 4)}
-                                        </SyntaxHighlighter>
+                                        </CodeBlock>
                                     </div>
                                 </CollapsibleContent>
                             </Collapsible>

@@ -1,8 +1,8 @@
 ﻿import { Head, Link, usePage } from '@inertiajs/react';
 import { ArrowUpRight, X, Terminal, Globe, FileText } from 'lucide-react';
 import React, { useState } from 'react';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { CodeBlock } from '@/components/code-block';
 import { EmptyState } from '@/components/empty-state';
 import { Pagination } from '@/components/pagination';
 import { Badge } from '@/components/ui/badge';
@@ -262,7 +262,7 @@ export default function LogsIndex({ records }: { records: any }) {
                                               'No context provided.';
 
                                     return (
-                                        <SyntaxHighlighter
+                                        <CodeBlock
                                             language="json"
                                             style={vscDarkPlus}
                                             customStyle={{
@@ -274,7 +274,7 @@ export default function LogsIndex({ records }: { records: any }) {
                                             wrapLongLines={true}
                                         >
                                             {jsonString}
-                                        </SyntaxHighlighter>
+                                        </CodeBlock>
                                     );
                                 })()}
                             </div>
