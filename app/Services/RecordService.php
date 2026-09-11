@@ -171,9 +171,16 @@ class RecordService
                 DB::raw('MAX('.$this->col('last_seen_at').') as last_seen'),
             ])
             ->groupBy('user_key')
-            ->orderBy('last_seen', 'desc')
-            ->paginate(20)
-            ->withQueryString();
+            ->orderBy('last_seen', 'desc');
+
+        // Counted as distinct users rather than by asking the database how
+        // many rows the grouping produces: `paginate()` answers that by
+        // running the whole aggregate a second time inside a subquery.
+        $users = $this->paginateWithKnownTotal(
+            $users,
+            $this->distinctUsers($project, null, $period, $from, $to),
+            perPage: 20,
+        );
 
         return [
             'users' => $this->enrichUserPaginator($project, $users),
@@ -1157,11 +1164,11 @@ class RecordService
     /**
      * Distinct groups of a type over the period, straight off the group rollups.
      */
-    protected function distinctGroups(Project $project, string $type, ?string $period, ?string $from, ?string $to, string $column = 'group_key'): int
+    protected function distinctGroups(Project $project, string|array $types, ?string $period, ?string $from, ?string $to, string $column = 'group_key'): int
     {
         return RecordGroupRollup::query()
             ->where('project_id', $project->id)
-            ->where('type', $type)
+            ->whereIn('type', (array) $types)
             ->forPeriod($period, $from, $to)
             ->distinct()
             ->count($column);
@@ -1290,15 +1297,19 @@ class RecordService
 
         $orderBy = $sortMap[$sort] ?? $sort;
 
-        return RecordGroupRollup::query()
+        $groups = RecordGroupRollup::query()
             ->where('project_id', $project->id)
             ->whereIn('type', (array) $types)
             ->forPeriod($period, $from, $to)
             ->select($columns)
             ->groupBy('group_key')
-            ->orderBy($orderBy, $direction)
-            ->paginate(20)
-            ->withQueryString()
+            ->orderBy($orderBy, $direction);
+
+        return $this->paginateWithKnownTotal(
+            $groups,
+            $this->distinctGroups($project, $types, $period, $from, $to),
+            perPage: 20,
+        )
             ->through(function ($row) {
                 $row->p95_duration = $this->p95Duration($row);
                 $row->avg_duration = round((float) $row->avg_duration, 2);
@@ -1334,11 +1345,11 @@ class RecordService
     /**
      * Distinct users seen for a type over a period.
      */
-    protected function distinctUsers(Project $project, string $type, ?string $period = null, ?string $from = null, ?string $to = null): int
+    protected function distinctUsers(Project $project, string|array|null $types = null, ?string $period = null, ?string $from = null, ?string $to = null): int
     {
         return RecordUserBucket::query()
             ->where('project_id', $project->id)
-            ->where('type', $type)
+            ->when($types !== null, fn ($query) => $query->whereIn('type', (array) $types))
             ->forPeriod($period, $from, $to)
             ->distinct()
             ->count('user_key');
