@@ -284,7 +284,7 @@ class RecordService
         $isRequest = $this->col('type')." = 'request'";
         $isException = $this->col('type')." = 'exception'";
 
-        $users = RecordUserBucket::query()
+        $usersQuery = RecordUserBucket::query()
             ->whereIn('project_id', $project->projectIds())
             ->forPeriod($period, $from, $to)
             ->select([
@@ -304,7 +304,7 @@ class RecordService
         // many rows the grouping produces: `paginate()` answers that by
         // running the whole aggregate a second time inside a subquery.
         $users = $this->paginateWithKnownTotal(
-            $users,
+            fn (int $page, int $perPage) => $usersQuery->forPage($page, $perPage)->get(),
             $this->distinctUsers($project, null, $period, $from, $to),
             perPage: 20,
         );
@@ -1570,7 +1570,7 @@ class RecordService
             ->orderBy($orderBy, $direction);
 
         return $this->paginateWithKnownTotal(
-            $groups,
+            fn (int $page, int $perPage) => $groups->forPage($page, $perPage)->get(),
             $this->distinctGroups($project, $types, $period, $from, $to),
             perPage: 20,
         )
