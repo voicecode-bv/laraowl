@@ -29,7 +29,6 @@ export default function ExceptionsIndex({
 }: {
     exceptions: any;
     timeSeries: any;
-    stats: any;
     overview: any;
     period?: string | null;
     from?: string | null;

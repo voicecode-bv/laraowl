@@ -96,7 +96,7 @@ export default function UptimeIndex({ checks, uptime_stats, period }: any) {
                     <div className="mb-2 text-xl font-black tracking-tight text-foreground">
                         {uptime_stats.last_check
                             ? new Date(
-                                  uptime_stats.last_check.checked_at,
+                                  uptime_stats.last_check,
                               ).toLocaleTimeString()
                             : 'Never'}
                     </div>

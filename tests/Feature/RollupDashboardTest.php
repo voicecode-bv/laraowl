@@ -322,6 +322,65 @@ test('rollups are scoped to their own project', function () {
         ->and(records()->getQuickStats($theirs, '1h')['requests'])->toBe(2);
 });
 
+test('the day view is folded into quarter-hour slots', function () {
+    $project = Project::factory()->create();
+
+    // Two minutes inside one quarter hour, plus one in the next.
+    $this->travelTo(now()->startOfHour()->addMinutes(2));
+    ingestBatch($project, [['t' => 'request', 'status_code' => 200, 'duration' => 10]]);
+
+    $this->travelTo(now()->addMinutes(5));
+    ingestBatch($project, [['t' => 'request', 'status_code' => 500, 'duration' => 30]]);
+
+    $this->travelTo(now()->addMinutes(10));
+    ingestBatch($project, [['t' => 'request', 'status_code' => 200, 'duration' => 50]]);
+
+    $series = records()->getDashboardStats($project, '24h')['timeSeries'];
+
+    // 96 quarter hours instead of 1440 minutes, which is what the charts draw.
+    expect($series)->toHaveCount(96);
+
+    $populated = collect($series)->where('total', '>', 0)->values();
+
+    expect($populated)->toHaveCount(2)
+        ->and($populated[0]['total'])->toBe(2)
+        ->and($populated[0]['ok'])->toBe(1)
+        ->and($populated[0]['server_error'])->toBe(1)
+        // Weighted over the folded minutes, not an average of their averages.
+        ->and($populated[0]['avg_duration'])->toBe(20.0)
+        ->and($populated[1]['total'])->toBe(1)
+        ->and($populated[1]['avg_duration'])->toBe(50.0);
+
+    $this->travelBack();
+});
+
+test('the week view keeps one slot per day', function () {
+    $project = Project::factory()->create();
+
+    ingestBatch($project, [['t' => 'request', 'status_code' => 200]]);
+
+    expect(records()->getDashboardStats($project, '7d')['timeSeries'])->toHaveCount(7);
+});
+
+test('a custom range is filled with the hours it covers', function () {
+    $project = Project::factory()->create();
+
+    $this->travelTo(now()->startOfHour()->subHours(2));
+    ingestBatch($project, [['t' => 'request', 'status_code' => 200, 'duration' => 15]]);
+    $this->travelBack();
+
+    $from = now()->startOfHour()->subHours(3)->format('Y-m-d H:i:s');
+    $to = now()->startOfHour()->format('Y-m-d H:i:s');
+
+    $series = records()->getDashboardStats($project, 'custom', $from, $to)['timeSeries'];
+
+    // The hour the request landed in has to survive the gap filling: the slot
+    // keys of a custom range are hours, not the minutes of the last hour.
+    expect($series)->toHaveCount(4)
+        ->and(collect($series)->sum('total'))->toBe(1)
+        ->and(collect($series)->firstWhere('total', 1)['avg_duration'])->toBe(15.0);
+});
+
 test('the time series splits authenticated requests from guest requests per bucket', function () {
     $project = Project::factory()->create();
 

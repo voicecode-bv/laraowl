@@ -13,8 +13,11 @@ use App\Models\RecordRollup;
 use App\Models\RecordUserBucket;
 use App\Models\UptimeCheck;
 use App\Support\ProjectContext;
+use App\Support\RollupCache;
 use Carbon\Carbon;
+use Closure;
 use Cron\CronExpression;
+use Illuminate\Contracts\Database\Query\Expression;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Pagination\LengthAwarePaginator;
@@ -27,10 +30,20 @@ class RecordService
 {
     use BuildsRollupQueries;
 
+    public function __construct(private readonly RollupCache $cache) {}
+
     /**
      * Get aggregated stats for various record types.
      */
     public function getQuickStats(ProjectContext $project, ?string $period = null, ?string $from = null, ?string $to = null): array
+    {
+        return $this->cache->remember('quick-stats', $this->cacheContext($project, $period, $from, $to), fn () => $this->readQuickStats($project, $period, $from, $to));
+    }
+
+    /**
+     * @return array<string, int>
+     */
+    private function readQuickStats(ProjectContext $project, ?string $period, ?string $from, ?string $to): array
     {
         $types = ['request', 'exception', 'query', 'queued-job', 'job-attempt', 'scheduled-task', 'cache-event', 'log', 'mail', 'notification', 'outgoing-request'];
 
@@ -94,19 +107,45 @@ class RecordService
     }
 
     /**
-     * Get comprehensive dashboard metrics.
+     * Every dashboard metric, in one call.
+     *
+     * Split into the three parts the screen loads separately — the cards, the
+     * charts, and the user panels — so a page view can render the cards
+     * immediately and defer the rest. This composition stays for callers that
+     * want the lot in one go.
      */
     public function getDashboardStats(ProjectContext $project, ?string $period = null, ?string $from = null, ?string $to = null): array
     {
-        $requestStats = $this->rollupTotals($project, 'request', $period, $from, $to);
-        $exceptionStats = $this->rollupTotals($project, 'exception', $period, $from, $to);
-        $jobStats = $this->rollupTotals($project, ['job-attempt', 'queued-job'], $period, $from, $to);
+        return [
+            ...$this->getDashboardSummary($project, $period, $from, $to),
+            ...$this->getDashboardCharts($project, $period, $from, $to),
+            ...$this->getDashboardUserPanels($project, $period, $from, $to),
+        ];
+    }
 
-        $impactedUsers = $this->topUsers($project, 'exception', 'error_count', $period, $from, $to);
-        $activeUsers = $this->topUsers($project, 'request', 'request_count', $period, $from, $to);
+    /**
+     * The counters and status cards: one grouped read over the rollups plus
+     * the distinct-user count.
+     */
+    public function getDashboardSummary(ProjectContext $project, ?string $period = null, ?string $from = null, ?string $to = null): array
+    {
+        return $this->cache->remember('dashboard-summary', $this->cacheContext($project, $period, $from, $to), fn () => $this->readDashboardSummary($project, $period, $from, $to));
+    }
 
-        $this->enrichUserRows($project, $impactedUsers);
-        $this->enrichUserRows($project, $activeUsers);
+    /**
+     * @return array<string, mixed>
+     */
+    private function readDashboardSummary(ProjectContext $project, ?string $period, ?string $from, ?string $to): array
+    {
+        $totals = $this->rollupTotalsByGroup($project, [
+            'request' => ['request'],
+            'exception' => ['exception'],
+            'job' => ['job-attempt', 'queued-job'],
+        ], $period, $from, $to);
+
+        $requestStats = $totals['request'];
+        $exceptionStats = $totals['exception'];
+        $jobStats = $totals['job'];
 
         return [
             'total_requests' => (int) $requestStats->total,
@@ -121,15 +160,6 @@ class RecordService
                 'min' => round((float) ($requestStats->min_duration ?? 0), 2),
             ],
             'total_exceptions' => (int) $exceptionStats->total,
-            'recent_issues' => Issue::query()
-                ->whereIn('project_id', $project->projectIds())
-                ->where('status', 'open')
-                ->with('project:id,name,slug')
-                ->latest('last_seen_at')
-                ->limit(5)
-                ->get(),
-            'timeSeries' => $this->getDetailedTimeSeries($project, 'request', $period, $from, $to),
-            'exceptionTimeSeries' => $this->getDetailedTimeSeries($project, 'exception', $period, $from, $to),
             'job_stats' => [
                 'total' => (int) $jobStats->total,
                 'processed' => (int) $jobStats->ok,
@@ -138,8 +168,6 @@ class RecordService
                 'avg_duration' => round($this->avgDuration($jobStats) / 1000, 2),
                 'p95_duration' => round($this->p95Duration($jobStats) / 1000, 2),
             ],
-            'impacted_users' => $impactedUsers,
-            'active_users' => $activeUsers,
             'auth_users_count' => $this->distinctUsers($project, 'request', $period, $from, $to),
             'guest_users_count' => (int) $requestStats->total - (int) $requestStats->authed,
             'period' => $period,
@@ -153,6 +181,60 @@ class RecordService
                     'down' => $project->last_uptime_status === 'down' ? 1 : 0,
                     'total' => 1,
                 ],
+        ];
+    }
+
+    /**
+     * The two chart series behind the dashboard, from one read per table.
+     */
+    public function getDashboardCharts(ProjectContext $project, ?string $period = null, ?string $from = null, ?string $to = null): array
+    {
+        return $this->cache->remember('dashboard-charts', $this->cacheContext($project, $period, $from, $to), function () use ($project, $period, $from, $to) {
+            $series = $this->detailedTimeSeriesByType($project, ['request', 'exception'], $period, $from, $to);
+
+            return [
+                'timeSeries' => $series['request'],
+                'exceptionTimeSeries' => $series['exception'],
+            ];
+        });
+    }
+
+    /**
+     * Everything a cached rollup read depends on. The project ids are sorted
+     * so that two scopes covering the same projects share an answer, and a
+     * custom range is pinned by its own bounds rather than by the word
+     * "custom".
+     *
+     * @return array<string, mixed>
+     */
+    private function cacheContext(ProjectContext $project, ?string $period, ?string $from, ?string $to): array
+    {
+        $projectIds = $project->projectIds();
+        sort($projectIds);
+
+        return [
+            'projects' => $projectIds,
+            'period' => $period,
+            'from' => $from,
+            'to' => $to,
+        ];
+    }
+
+    /**
+     * The impacted and most active users panels.
+     */
+    public function getDashboardUserPanels(ProjectContext $project, ?string $period = null, ?string $from = null, ?string $to = null): array
+    {
+        $impactedUsers = $this->topUsers($project, 'exception', 'error_count', $period, $from, $to);
+        $activeUsers = $this->topUsers($project, 'request', 'request_count', $period, $from, $to);
+
+        // Both panels name the same people as often as not, so they are
+        // resolved together: the rows are the same objects either way.
+        $this->enrichUserRows($project, $impactedUsers->concat($activeUsers));
+
+        return [
+            'impacted_users' => $impactedUsers,
+            'active_users' => $activeUsers,
         ];
     }
 
@@ -676,14 +758,10 @@ class RecordService
      */
     protected function paginateRawRecords(ProjectContext $project, string $type, ?string $search, ?string $period, ?string $from, ?string $to, bool $searchMessage = false): LengthAwarePaginator
     {
-        $query = Record::query()
-            ->whereIn('project_id', $project->projectIds())
-            ->with('project:id,name,slug')
-            ->ofType($type)
-            ->forPeriod($period, $from, $to)
-            ->latest();
-
         if ($search) {
+            $query = $this->rawRecordsQuery($project, $type, $period, $from, $to)
+                ->whereIn('project_id', $project->projectIds());
+
             if ($searchMessage) {
                 $this->applyMessageSearch($query, $search);
             } else {
@@ -693,7 +771,95 @@ class RecordService
             return $query->paginate(50)->withQueryString();
         }
 
-        return $this->paginateWithKnownTotal($query, $this->rollupCount($project, $type, $period, $from, $to));
+        return $this->paginateWithKnownTotal(
+            fn (int $page, int $perPage) => $this->rawRecordsPage($project, $type, $period, $from, $to, $page, $perPage),
+            $this->rollupCount($project, $type, $period, $from, $to),
+        );
+    }
+
+    /**
+     * The shared shape of a raw record listing: newest first, with a stable
+     * tie-break so a record shared a timestamp with another cannot show up on
+     * two pages or on neither.
+     *
+     * @return Builder<Record>
+     */
+    protected function rawRecordsQuery(ProjectContext $project, string $type, ?string $period, ?string $from, ?string $to): Builder
+    {
+        return Record::query()
+            ->with('project:id,name,slug')
+            ->ofType($type)
+            ->forPeriod($period, $from, $to)
+            ->orderByDesc('created_at')
+            ->orderByDesc('id');
+    }
+
+    /**
+     * One page of raw records, newest first, across every project in scope.
+     *
+     * A single project is an index walk: `(project_id, type, created_at)`
+     * delivers the rows already ordered, so the database reads a page and
+     * stops. The "All" scope cannot do that — an `IN` list on the leading
+     * column gives the engine one range per project and no way to merge them
+     * in order, so it reads every matching record of every project in the
+     * period and sorts the lot to hand back fifty rows.
+     *
+     * So the merge is done here instead: each project contributes the page's
+     * worth of its own newest ids through its own index, and only those few
+     * hundred candidates are ordered to pick the page. That is two queries
+     * rather than one, both bounded by the page, neither by the table.
+     *
+     * @return Collection<int, Record>
+     */
+    protected function rawRecordsPage(ProjectContext $project, string $type, ?string $period, ?string $from, ?string $to, int $page, int $perPage): Collection
+    {
+        $projectIds = $project->projectIds();
+
+        if (count($projectIds) <= 1) {
+            return $this->rawRecordsQuery($project, $type, $period, $from, $to)
+                ->whereIn('project_id', $projectIds)
+                ->forPage($page, $perPage)
+                ->get();
+        }
+
+        $candidates = null;
+        $depth = $page * $perPage;
+
+        foreach ($projectIds as $projectId) {
+            $newest = Record::query()
+                ->where('project_id', $projectId)
+                ->ofType($type)
+                ->forPeriod($period, $from, $to)
+                ->orderByDesc('created_at')
+                ->orderByDesc('id')
+                ->limit($depth)
+                ->select(['id', 'created_at'])
+                ->toBase();
+
+            // Each branch keeps its own `order by` and `limit` inside a
+            // subquery: on a compound select those clauses would otherwise
+            // read as belonging to the union as a whole.
+            $branch = DB::query()
+                ->select(['id', 'created_at'])
+                ->fromSub($newest, 'newest_'.$projectId);
+
+            $candidates = $candidates === null ? $branch : $candidates->unionAll($branch);
+        }
+
+        $ids = DB::query()
+            ->fromSub($candidates, 'candidates')
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->forPage($page, $perPage)
+            ->pluck('id');
+
+        if ($ids->isEmpty()) {
+            return collect();
+        }
+
+        return $this->rawRecordsQuery($project, $type, $period, $from, $to)
+            ->whereKey($ids->all())
+            ->get();
     }
 
     /**
@@ -807,6 +973,22 @@ class RecordService
      */
     protected function getDetailedTimeSeries(ProjectContext $project, string $type, ?string $period = null, ?string $from = null, ?string $to = null): array
     {
+        return $this->detailedTimeSeriesByType($project, [$type], $period, $from, $to)[$type];
+    }
+
+    /**
+     * The same series for several record types, in one read per table.
+     *
+     * The dashboard charts requests and exceptions side by side, which used
+     * to be two passes over `record_rollups` and two over
+     * `record_user_buckets` — same project, same period, same buckets. The
+     * type joins the group-by instead, and the rows are split per type here.
+     *
+     * @param  list<string>  $types
+     * @return array<string, list<array<string, mixed>>>
+     */
+    protected function detailedTimeSeriesByType(ProjectContext $project, array $types, ?string $period = null, ?string $from = null, ?string $to = null): array
+    {
         $period = $period ?: '1h';
 
         $groupsByMinute = ! in_array($period, ['7d', '14d', '30d', 'custom'], true);
@@ -816,9 +998,10 @@ class RecordService
 
         $results = RecordRollup::query()
             ->whereIn('project_id', $project->projectIds())
-            ->where('type', $type)
+            ->whereIn('type', $types)
             ->forPeriod($period, $from, $to)
             ->select([
+                'type',
                 DB::raw("{$bucket} as minute"),
                 $sum('count', 'total'),
                 $sum('ok_count', 'ok'),
@@ -828,50 +1011,105 @@ class RecordService
                 $sum('misses', 'misses'),
                 $sum('writes', 'writes'),
                 $sum('authed_count', 'authed'),
-                DB::raw('SUM('.$this->col('sum_duration').') / NULLIF(SUM('.$this->col('count_duration').'), 0) as avg_duration'),
+                $sum('sum_duration', 'sum_duration'),
+                $sum('count_duration', 'count_duration'),
             ])
-            ->groupBy('minute')
+            ->groupBy('type', 'minute')
             ->get();
 
         $userBucket = $groupsByMinute ? $this->col('bucket') : $bucket;
 
         $activeUsers = RecordUserBucket::query()
             ->whereIn('project_id', $project->projectIds())
-            ->where('type', $type)
+            ->whereIn('type', $types)
             ->forPeriod($period, $from, $to)
             ->select([
+                'type',
                 DB::raw("{$userBucket} as slot"),
                 DB::raw('COUNT(DISTINCT '.$this->col('user_key').') as active_users'),
             ])
-            ->groupBy('slot')
+            ->groupBy('type', 'slot')
             ->get()
             ->mapWithKeys(fn ($row) => [
-                $groupsByMinute ? Carbon::parse($row->slot)->format('Y-m-d H') : $row->slot => (int) $row->active_users,
+                $row->type.'@'.($groupsByMinute ? Carbon::parse($row->slot)->format('Y-m-d H') : $row->slot) => (int) $row->active_users,
             ]);
 
-        $results = $results->mapWithKeys(function ($row) use ($activeUsers, $groupsByMinute) {
-            $key = $this->seriesKey($row->minute, $groupsByMinute);
-            $userSlot = $groupsByMinute ? Carbon::parse($row->minute)->format('Y-m-d H') : $row->minute;
-            $authed = (int) $row->authed;
+        $slots = [];
 
-            return [$key => [
+        foreach ($results as $row) {
+            $key = $this->seriesKey($row->minute, $groupsByMinute, $period);
+            $userSlot = $row->type.'@'.($groupsByMinute ? Carbon::parse($row->minute)->format('Y-m-d H') : $row->minute);
+
+            $slot = $slots[$row->type][$key] ?? [
                 'minute' => $key,
-                'total' => (int) $row->total,
-                'ok' => (int) $row->ok,
-                'client_error' => (int) $row->client_error,
-                'server_error' => (int) $row->server_error,
-                'avg_duration' => round((float) $row->avg_duration, 2),
-                'hits' => (int) $row->hits,
-                'misses' => (int) $row->misses,
-                'writes' => (int) $row->writes,
-                'active_users' => $activeUsers[$userSlot] ?? 0,
-                'total_requests' => (int) $row->total,
-                'authed' => $authed,
-                'guest' => max((int) $row->total - $authed, 0),
-            ]];
-        });
+                'total' => 0,
+                'ok' => 0,
+                'client_error' => 0,
+                'server_error' => 0,
+                'avg_duration' => 0.0,
+                'hits' => 0,
+                'misses' => 0,
+                'writes' => 0,
+                'active_users' => 0,
+                'total_requests' => 0,
+                'authed' => 0,
+                'guest' => 0,
+                'sum_duration' => 0.0,
+                'count_duration' => 0,
+            ];
 
-        return $this->fillTimeSeriesGaps($results, $period, $from, $to);
+            $slot['total'] += (int) $row->total;
+            $slot['ok'] += (int) $row->ok;
+            $slot['client_error'] += (int) $row->client_error;
+            $slot['server_error'] += (int) $row->server_error;
+            $slot['hits'] += (int) $row->hits;
+            $slot['misses'] += (int) $row->misses;
+            $slot['writes'] += (int) $row->writes;
+            $slot['authed'] += (int) $row->authed;
+            $slot['sum_duration'] += (float) $row->sum_duration;
+            $slot['count_duration'] += (int) $row->count_duration;
+
+            // One value per hour, so every minute folded into this slot reports
+            // the same count rather than one to add up.
+            $slot['active_users'] = max($slot['active_users'], $activeUsers[$userSlot] ?? 0);
+
+            $slots[$row->type][$key] = $slot;
+        }
+
+        $series = [];
+
+        foreach ($types as $type) {
+            $series[$type] = $this->fillTimeSeriesGaps(
+                collect($slots[$type] ?? [])->map($this->finishSlot()),
+                $period,
+                $from,
+                $to,
+            );
+        }
+
+        return $series;
+    }
+
+    /**
+     * Turn an accumulated slot into the shape the charts read.
+     *
+     * @return callable(array<string, mixed>): array<string, mixed>
+     */
+    private function finishSlot(): callable
+    {
+        return function (array $slot): array {
+            $slot['total_requests'] = $slot['total'];
+            $slot['guest'] = max($slot['total'] - $slot['authed'], 0);
+            // Recomputed from the summed numerator/denominator: averaging the
+            // per-minute averages would weight a quiet minute like a busy one.
+            $slot['avg_duration'] = $slot['count_duration'] > 0
+                ? round($slot['sum_duration'] / $slot['count_duration'], 2)
+                : 0.0;
+
+            unset($slot['sum_duration'], $slot['count_duration']);
+
+            return $slot;
+        };
     }
 
     private function enrichUserPaginator(ProjectContext $project, LengthAwarePaginator $paginator): LengthAwarePaginator
@@ -915,6 +1153,16 @@ class RecordService
     }
 
     /**
+     * The display name and email behind a set of user identifiers, read from
+     * the most recent `user` record for each of them.
+     *
+     * Filtered on the indexed `user_key` column rather than on a JSON
+     * expression over `payload`, so this stays an index lookup on a records
+     * table with millions of rows. The identifiers are resolved in two steps
+     * — newest row id per user, then the payloads for those ids — because the
+     * alternative is reading every matching row just to throw all but the
+     * newest away.
+     *
      * @param  array<int, int|string>  $ids
      * @return array<string, array{name: string, email: string}>
      */
@@ -930,19 +1178,30 @@ class RecordService
             return [];
         }
 
+        $latestIds = Record::query()
+            ->whereIn('project_id', $project->projectIds())
+            ->ofType('user')
+            ->whereIn('user_key', $ids->all())
+            ->groupBy('user_key')
+            ->selectRaw('MAX('.$this->col('id').') as id')
+            ->toBase()
+            ->pluck('id')
+            ->all();
+
+        if ($latestIds === []) {
+            return [];
+        }
+
         $details = [];
 
         Record::query()
-            ->whereIn('project_id', $project->projectIds())
-            ->ofType('user')
-            ->whereIn(DB::raw($this->jsonText('id')), $ids->all())
-            ->latest()
-            ->get(['payload'])
-            ->each(function ($record) use (&$details): void {
-                $payload = $record->payload;
-                $id = (string) ($payload['id'] ?? '');
+            ->whereIn('id', $latestIds)
+            ->get(['user_key', 'payload'])
+            ->each(function (Record $record) use (&$details): void {
+                $payload = $record->payload ?? [];
+                $id = (string) ($record->user_key ?? $payload['id'] ?? '');
 
-                if ($id === '' || isset($details[$id])) {
+                if ($id === '') {
                     return;
                 }
 
@@ -957,6 +1216,14 @@ class RecordService
         return $details;
     }
 
+    /**
+     * The uptime screen: a page of checks plus the summary above it.
+     *
+     * Both read the selected period. The summary used to count, average and
+     * sort the project's entire check history in four separate queries — work
+     * that grew with every check ever stored, for cards that say "last
+     * {period}" — and it is one indexed aggregate over the period now.
+     */
     public function getUptimeStats(ProjectContext $project, ?string $period = null, ?string $from = null, ?string $to = null): array
     {
         if ($project instanceof Project && ! $project->hasUptimeMonitoring()) {
@@ -971,37 +1238,37 @@ class RecordService
             ];
         }
 
-        $query = UptimeCheck::query()
+        $checks = UptimeCheck::query()
             ->whereIn('project_id', $project->projectIds())
             ->when($project->isAggregate(), fn ($q) => $q->with('project:id,name,slug'))
-            ->orderBy('checked_at', 'desc');
+            ->forPeriod($period, $from, $to)
+            ->orderBy('checked_at', 'desc')
+            ->paginate(50)
+            ->withQueryString();
 
-        if ($period && $period !== 'all') {
-            $minutes = match ($period) {
-                '1h' => 60,
-                '24h' => 1440,
-                '7d' => 10080,
-                '30d' => 43200,
-                default => 1440
-            };
-            $query->where('checked_at', '>=', now()->subMinutes($minutes));
-        }
+        $totals = UptimeCheck::query()
+            ->whereIn('project_id', $project->projectIds())
+            ->forPeriod($period, $from, $to)
+            ->selectRaw('COUNT(*) as total_checks')
+            ->selectRaw('SUM(CASE WHEN '.$this->col('status')." = 'up' THEN 1 ELSE 0 END) as up_checks")
+            ->selectRaw('AVG('.$this->col('response_time').') as avg_response_time')
+            ->selectRaw('MAX('.$this->col('checked_at').') as last_check')
+            ->toBase()
+            ->first();
 
-        $checks = $query->paginate(50)->withQueryString();
-
-        $totalChecks = UptimeCheck::query()->whereIn('project_id', $project->projectIds())->count();
-        $upChecks = UptimeCheck::query()->whereIn('project_id', $project->projectIds())->where('status', 'up')->count();
-
-        $stats = [
-            'uptime_percentage' => $totalChecks > 0 ? round(($upChecks / $totalChecks) * 100, 2) : 100,
-            'avg_response_time' => round(UptimeCheck::query()->whereIn('project_id', $project->projectIds())->avg('response_time') ?? 0, 2),
-            'last_check' => UptimeCheck::query()->whereIn('project_id', $project->projectIds())->latest('checked_at')->first(),
-            'total_checks' => $totalChecks,
-        ];
+        $totalChecks = (int) ($totals->total_checks ?? 0);
+        $lastCheck = $totals->last_check ?? null;
 
         return [
             'checks' => $checks,
-            'uptime_stats' => $stats,
+            'uptime_stats' => [
+                'uptime_percentage' => $totalChecks > 0
+                    ? round(((int) $totals->up_checks / $totalChecks) * 100, 2)
+                    : 100,
+                'avg_response_time' => round((float) ($totals->avg_response_time ?? 0), 2),
+                'last_check' => $lastCheck ? Carbon::parse($lastCheck)->toIso8601String() : null,
+                'total_checks' => $totalChecks,
+            ],
         ];
     }
 
@@ -1047,17 +1314,18 @@ class RecordService
     }
 
     /**
-     * Paginate raw records without asking the database to count them.
+     * Paginate raw records without asking the database to count them: the
+     * rollups already know how many there are.
      *
-     * @param  Builder<Record>|HasMany<Record, Project>  $query
+     * @param  Closure(int, int): Collection<int, Record>  $items
      */
-    protected function paginateWithKnownTotal($query, int $total, int $perPage = 50): LengthAwarePaginator
+    protected function paginateWithKnownTotal(Closure $items, int $total, int $perPage = 50): LengthAwarePaginator
     {
         $page = Paginator::resolveCurrentPage();
 
         $items = $total === 0
             ? collect()
-            : $query->forPage($page, $perPage)->get();
+            : $items($page, $perPage);
 
         return new LengthAwarePaginator($items, $total, $perPage, $page, [
             'path' => Paginator::resolveCurrentPath(),
@@ -1099,6 +1367,64 @@ class RecordService
      */
     protected function rollupTotals(ProjectContext $project, string|array $types, ?string $period = null, ?string $from = null, ?string $to = null): object
     {
+        return RecordRollup::query()
+            ->whereIn('project_id', $project->projectIds())
+            ->whereIn('type', (array) $types)
+            ->forPeriod($period, $from, $to)
+            ->select($this->totalsColumns())
+            ->first();
+    }
+
+    /**
+     * The same totals for several groups of types, in one read.
+     *
+     * A screen that reports on requests, exceptions and jobs side by side
+     * used to run `rollupTotals()` once per group: three aggregates over the
+     * same rows of the same table, filtered by the same project and period.
+     * The groups are folded into one `CASE` the query groups by instead.
+     *
+     * Groups with no rows in the period are absent from the result set, so
+     * they are zero filled: a caller reads `->total` either way.
+     *
+     * @param  array<string, list<string>>  $groups  label => record types
+     * @return array<string, object>
+     */
+    protected function rollupTotalsByGroup(ProjectContext $project, array $groups, ?string $period = null, ?string $from = null, ?string $to = null): array
+    {
+        $case = 'CASE';
+
+        foreach ($groups as $label => $types) {
+            $quoted = implode(', ', array_map([$this, 'quoteLiteral'], $types));
+            $case .= ' WHEN '.$this->col('type').' IN ('.$quoted.') THEN '.$this->quoteLiteral((string) $label);
+        }
+
+        $case .= ' END';
+
+        $rows = RecordRollup::query()
+            ->whereIn('project_id', $project->projectIds())
+            ->whereIn('type', array_merge(...array_values($groups)))
+            ->forPeriod($period, $from, $to)
+            ->select(array_merge($this->totalsColumns(), [DB::raw($case.' as total_group')]))
+            ->groupBy('total_group')
+            ->get()
+            ->keyBy('total_group');
+
+        $totals = [];
+
+        foreach (array_keys($groups) as $label) {
+            $totals[$label] = $rows->get($label) ?? $this->emptyTotals();
+        }
+
+        return $totals;
+    }
+
+    /**
+     * The aggregate columns behind a set of rollup totals.
+     *
+     * @return list<Expression>
+     */
+    private function totalsColumns(): array
+    {
         $sum = fn (string $column, string $alias) => DB::raw('COALESCE(SUM('.$this->col($column).'), 0) as '.$alias);
 
         $columns = [
@@ -1121,12 +1447,35 @@ class RecordService
             $columns[] = $sum($column, $column);
         }
 
-        return RecordRollup::query()
-            ->whereIn('project_id', $project->projectIds())
-            ->whereIn('type', (array) $types)
-            ->forPeriod($period, $from, $to)
-            ->select($columns)
-            ->first();
+        return $columns;
+    }
+
+    /**
+     * A totals row for a group the period holds no rows for.
+     */
+    private function emptyTotals(): object
+    {
+        $totals = [
+            'total' => 0,
+            'ok' => 0,
+            'client_error' => 0,
+            'server_error' => 0,
+            'neutral' => 0,
+            'hits' => 0,
+            'misses' => 0,
+            'writes' => 0,
+            'authed' => 0,
+            'sum_duration' => 0,
+            'count_duration' => 0,
+            'max_duration' => null,
+            'min_duration' => null,
+        ];
+
+        foreach (RollupWriter::latencyColumns() as $column) {
+            $totals[$column] = 0;
+        }
+
+        return (object) $totals;
     }
 
     /**

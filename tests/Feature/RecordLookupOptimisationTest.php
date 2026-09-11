@@ -34,6 +34,46 @@ test('the user and ip are lifted into indexed columns at ingest', function () {
         ->and($records[3]->user_key)->toBe('7');
 });
 
+test('a user record is keyed by the identifier at its payload root', function () {
+    $project = Project::factory()->create();
+
+    ingestLookup($project, [
+        ['t' => 'user', 'id' => 99, 'name' => 'Ada Lovelace', 'username' => 'ada@example.com'],
+        ['t' => 'user', 'name' => 'Nobody'],
+    ]);
+
+    $records = Record::where('project_id', $project->id)->orderBy('id')->get();
+
+    // Keyed, so the name/email lookup behind the user panels can filter on the
+    // index instead of on a JSON expression over every user record.
+    expect($records[0]->user_key)->toBe('99')
+        ->and($records[1]->user_key)->toBeNull();
+});
+
+test('user detail lookups never scan the payload column', function () {
+    $project = Project::factory()->create();
+
+    ingestLookup($project, [
+        ['t' => 'user', 'id' => 5, 'name' => 'Stale Name', 'username' => 'stale@example.com'],
+        ['t' => 'user', 'id' => 5, 'name' => 'Grace Hopper', 'username' => 'grace@example.com'],
+        ['t' => 'request', 'status_code' => 200, 'duration' => 10, 'user' => 5],
+    ]);
+
+    $queries = [];
+    DB::listen(function ($query) use (&$queries) {
+        $queries[] = $query->sql;
+    });
+
+    $stats = app(RecordService::class)->getDashboardStats($project, '24h');
+    $user = $stats['active_users']->first();
+
+    // The newest user record wins, and nothing filters on a JSON expression:
+    // the identifiers are matched on the indexed `user_key` column instead.
+    expect($user->user_identifier)->toBe('Grace Hopper')
+        ->and($user->user_email)->toBe('grace@example.com')
+        ->and(collect($queries)->filter(fn (string $sql) => str_contains($sql, 'json_extract'))->all())->toBe([]);
+});
+
 test('user history resolves the md5 hash and reads the indexed column', function () {
     $project = Project::factory()->create();
 

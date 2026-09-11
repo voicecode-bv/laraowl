@@ -9,6 +9,7 @@ use App\Models\Team;
 use App\Services\RecordService;
 use App\Support\ExceptionTrace;
 use App\Support\ProjectContext;
+use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 use Inertia\Inertia;
@@ -57,7 +58,6 @@ class RecordController extends Controller
         return Inertia::render($this->resolveComponentPath($routeName), [
             'records' => $this->recordService->getPaginatedRecords($scope, $type, $request->search, $period, $from, $to),
             'filters' => $request->only(['search', 'period', 'from', 'to']),
-            'stats' => $this->recordService->getQuickStats($scope, $period, $from, $to),
             'period' => $period,
             'from' => $from,
             'to' => $to,
@@ -67,9 +67,42 @@ class RecordController extends Controller
     /**
      * Specialized Domain Renderers
      */
+    /**
+     * The dashboard renders in three parts.
+     *
+     * The cards come from one grouped read and are answered straight away;
+     * the charts and the user panels are deferred, so the screen paints
+     * before either has been queried. Each part resolves through a memoised
+     * closure, which keeps two things true: a part nobody asked for costs
+     * nothing (a deferred follow-up requests only its own group, so the
+     * others are never resolved), and the two props inside a group share the
+     * single read that produced them.
+     */
     protected function renderDashboardIndex(ProjectContext $project, string $period, ?string $from, ?string $to): Response
     {
-        return $this->renderWithStats('dashboard', $this->recordService->getDashboardStats($project, $period, $from, $to), $project, $period, $from, $to);
+        $summary = $this->memoize(fn () => $this->recordService->getDashboardSummary($project, $period, $from, $to));
+        $charts = $this->memoize(fn () => $this->recordService->getDashboardCharts($project, $period, $from, $to));
+        $panels = $this->memoize(fn () => $this->recordService->getDashboardUserPanels($project, $period, $from, $to));
+
+        return Inertia::render('dashboard/index', [
+            ...$this->lazyProps($summary, [
+                'total_requests',
+                'request_breakdown',
+                'duration_stats',
+                'total_exceptions',
+                'job_stats',
+                'auth_users_count',
+                'guest_users_count',
+                'uptime_status',
+            ]),
+            'timeSeries' => Inertia::defer(fn () => $charts()['timeSeries'], 'charts'),
+            'exceptionTimeSeries' => Inertia::defer(fn () => $charts()['exceptionTimeSeries'], 'charts'),
+            'impacted_users' => Inertia::defer(fn () => $panels()['impacted_users'], 'panels'),
+            'active_users' => Inertia::defer(fn () => $panels()['active_users'], 'panels'),
+            'period' => $period,
+            'from' => $from,
+            'to' => $to,
+        ]);
     }
 
     protected function renderRequestsIndex(ProjectContext $project, string $period, ?string $from, ?string $to): Response
@@ -77,7 +110,16 @@ class RecordController extends Controller
         $sort = request()->query('sort', 'total');
         $direction = request()->query('direction', 'desc');
 
-        return $this->renderWithStats('projects/requests', $this->recordService->getRequestStats($project, $period, $from, $to, $sort, $direction), $project, $period, $from, $to);
+        return $this->renderWithStats(
+            'projects/requests',
+            $this->recordService->getRequestStats($project, $period, $from, $to, $sort, $direction),
+            $project,
+            $period,
+            $from,
+            $to,
+            // The only screen that renders the cross-type record counts.
+            withQuickStats: true,
+        );
     }
 
     protected function renderUsersIndex(ProjectContext $project, string $period, ?string $from, ?string $to): Response
@@ -145,7 +187,6 @@ class RecordController extends Controller
         return Inertia::render('projects/logs/index', [
             'records' => $this->recordService->getLogRecords($project, request('search'), $period, $from, $to),
             'filters' => request()->only(['search', 'period', 'from', 'to']),
-            'stats' => $this->recordService->getQuickStats($project, $period, $from, $to),
             'period' => $period,
             'from' => $from,
             'to' => $to,
@@ -255,14 +296,57 @@ class RecordController extends Controller
         ]);
     }
 
-    protected function renderWithStats(string $component, array $data, ProjectContext $project, string $period, ?string $from = null, ?string $to = null): Response
+    /**
+     * Resolve a value at most once, however many props read it.
+     *
+     * @template TValue
+     *
+     * @param  Closure(): TValue  $resolver
+     * @return Closure(): TValue
+     */
+    protected function memoize(Closure $resolver): Closure
+    {
+        $resolved = null;
+
+        return function () use ($resolver, &$resolved) {
+            return $resolved ??= $resolver();
+        };
+    }
+
+    /**
+     * Spread part of a payload across props that each resolve on demand, so
+     * a request that does not ask for them never pays for the read behind
+     * them.
+     *
+     * @param  Closure(): array<string, mixed>  $resolver
+     * @param  list<string>  $keys
+     * @return array<string, Closure(): mixed>
+     */
+    protected function lazyProps(Closure $resolver, array $keys): array
+    {
+        $props = [];
+
+        foreach ($keys as $key) {
+            $props[$key] = fn () => $resolver()[$key];
+        }
+
+        return $props;
+    }
+
+    /**
+     * `$withQuickStats` is opt-in because `getQuickStats()` aggregates every
+     * record type in one go: paying for it on the screens that never render
+     * it is an aggregate query per page view for nothing.
+     */
+    protected function renderWithStats(string $component, array $data, ProjectContext $project, string $period, ?string $from = null, ?string $to = null, bool $withQuickStats = false): Response
     {
         return Inertia::render($component.'/index', array_merge($data, [
-            'stats' => $this->recordService->getQuickStats($project, $period, $from, $to),
             'period' => $period,
             'from' => $from,
             'to' => $to,
-        ]));
+        ], $withQuickStats ? [
+            'stats' => $this->recordService->getQuickStats($project, $period, $from, $to),
+        ] : []));
     }
 
     protected function resolveTypeFromRoute(string $routeName): string

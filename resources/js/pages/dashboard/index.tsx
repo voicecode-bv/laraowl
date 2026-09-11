@@ -1,4 +1,4 @@
-﻿import { Head, usePage, Link } from '@inertiajs/react';
+﻿import { Deferred, Head, usePage, Link } from '@inertiajs/react';
 import { formatDistanceToNow } from 'date-fns';
 import {
     Activity as ActivityIcon,
@@ -21,10 +21,45 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
 import { useLiveReload } from '@/hooks/use-live-reload';
 import AppLayout from '@/layouts/app-layout';
 import { appendMonitoringQuery } from '@/lib/monitoring-query';
 import { formatMicroSeconds, formatCompactNumber } from '@/lib/utils';
+
+/**
+ * Holds a chart's space while its series is still being deferred, so the card
+ * keeps its height instead of collapsing and reflowing the page.
+ */
+function ChartFrame({
+    ready,
+    height,
+    className,
+    children,
+}: {
+    ready: boolean;
+    height: string;
+    className?: string;
+    children: React.ReactNode;
+}) {
+    const classes = `${height} w-full ${className ?? ''}`.trim();
+
+    if (!ready) {
+        return <Skeleton className={classes} />;
+    }
+
+    return <div className={classes}>{children}</div>;
+}
+
+function UserRowsSkeleton({ rows }: { rows: number }) {
+    return (
+        <div className="mb-8 space-y-2">
+            {Array.from({ length: rows }).map((_, i) => (
+                <Skeleton key={i} className="h-16 w-full" />
+            ))}
+        </div>
+    );
+}
 
 export default function Dashboard({
     total_requests,
@@ -367,7 +402,10 @@ export default function Dashboard({
                                         </div>
                                     </div>
                                 </div>
-                                <div className="h-[120px] w-full">
+                                <ChartFrame
+                                    ready={Boolean(timeSeries)}
+                                    height="h-[120px]"
+                                >
                                     <ResponsiveContainer
                                         width="100%"
                                         height="100%"
@@ -458,7 +496,7 @@ export default function Dashboard({
                                             />
                                         </BarChart>
                                     </ResponsiveContainer>
-                                </div>
+                                </ChartFrame>
                             </CardContent>
                         </Card>
 
@@ -509,7 +547,10 @@ export default function Dashboard({
                                         </div>
                                     </div>
                                 </div>
-                                <div className="h-[120px] w-full">
+                                <ChartFrame
+                                    ready={Boolean(timeSeries)}
+                                    height="h-[120px]"
+                                >
                                     <ResponsiveContainer
                                         width="100%"
                                         height="100%"
@@ -585,7 +626,7 @@ export default function Dashboard({
                                             />
                                         </AreaChart>
                                     </ResponsiveContainer>
-                                </div>
+                                </ChartFrame>
                             </CardContent>
                         </Card>
                     </div>
@@ -623,12 +664,19 @@ export default function Dashboard({
                                 last {period}.
                             </h3>
                             <p className="text-xs font-medium text-muted-foreground">
-                                Errors have impacted{' '}
-                                {impacted_users?.length || 0} users.
+                                {impacted_users ? (
+                                    `Errors have impacted ${impacted_users.length} users.`
+                                ) : (
+                                    <Skeleton className="inline-block h-3 w-44 align-middle" />
+                                )}
                             </p>
 
                             <div className="mt-auto pt-8">
-                                <div className="mb-8 flex h-[100px] w-full items-end gap-1">
+                                <ChartFrame
+                                    ready={Boolean(exceptionTimeSeries)}
+                                    height="h-[100px]"
+                                    className="mb-8 flex items-end gap-1"
+                                >
                                     {exceptionSeries.map(
                                         (d: any, i: number) => (
                                             <div
@@ -648,7 +696,7 @@ export default function Dashboard({
                                             </div>
                                         ),
                                     )}
-                                </div>
+                                </ChartFrame>
                                 <div className="mb-6 flex items-center gap-4 text-[9px] font-black tracking-widest text-muted-foreground/60 uppercase">
                                     <div className="flex items-center gap-1.5">
                                         <span className="size-1.5 rounded-full bg-muted-foreground/20"></span>{' '}
@@ -774,43 +822,51 @@ export default function Dashboard({
                                 EXCEPTIONS
                             </Badge>
                             <h3 className="mb-8 text-xl leading-tight font-black tracking-tight text-foreground">
-                                {impacted_users?.length || 0} user impacted by
-                                exceptions in the last {period}.
+                                {impacted_users ? (
+                                    `${impacted_users.length} user impacted by exceptions in the last ${period}.`
+                                ) : (
+                                    <Skeleton className="h-12 w-full" />
+                                )}
                             </h3>
 
-                            <div className="mb-8 space-y-2">
-                                {impacted_users
-                                    ?.slice(0, 1)
-                                    .map((u: any, i: number) => (
-                                        <div
-                                            key={i}
-                                            className="group flex items-center justify-between rounded-xl border border-border bg-muted/30 p-3 transition-all hover:border-primary/30"
-                                        >
-                                            <div className="flex items-center gap-3">
-                                                <div className="flex size-10 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 text-xs font-black text-foreground uppercase shadow-lg">
-                                                    {u.user_identifier.substring(
-                                                        0,
-                                                        1,
-                                                    )}
-                                                </div>
-                                                <div className="min-w-0">
-                                                    <div className="truncate text-sm font-black text-foreground">
-                                                        {u.user_identifier}
+                            <Deferred
+                                data="impacted_users"
+                                fallback={<UserRowsSkeleton rows={1} />}
+                            >
+                                <div className="mb-8 space-y-2">
+                                    {impacted_users
+                                        ?.slice(0, 1)
+                                        .map((u: any, i: number) => (
+                                            <div
+                                                key={i}
+                                                className="group flex items-center justify-between rounded-xl border border-border bg-muted/30 p-3 transition-all hover:border-primary/30"
+                                            >
+                                                <div className="flex items-center gap-3">
+                                                    <div className="flex size-10 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 text-xs font-black text-foreground uppercase shadow-lg">
+                                                        {u.user_identifier.substring(
+                                                            0,
+                                                            1,
+                                                        )}
                                                     </div>
-                                                    <div className="truncate text-[10px] text-muted-foreground opacity-60">
-                                                        {u.user_email ||
-                                                            (u.user_id &&
-                                                                `ID: ${u.user_id}`)}
+                                                    <div className="min-w-0">
+                                                        <div className="truncate text-sm font-black text-foreground">
+                                                            {u.user_identifier}
+                                                        </div>
+                                                        <div className="truncate text-[10px] text-muted-foreground opacity-60">
+                                                            {u.user_email ||
+                                                                (u.user_id &&
+                                                                    `ID: ${u.user_id}`)}
+                                                        </div>
                                                     </div>
                                                 </div>
+                                                <Badge className="h-5 animate-pulse gap-1 border-none bg-red-500 px-1.5 text-[10px] font-black text-foreground">
+                                                    <AlertCircle className="size-2.5" />{' '}
+                                                    {u.error_count}
+                                                </Badge>
                                             </div>
-                                            <Badge className="h-5 animate-pulse gap-1 border-none bg-red-500 px-1.5 text-[10px] font-black text-foreground">
-                                                <AlertCircle className="size-2.5" />{' '}
-                                                {u.error_count}
-                                            </Badge>
-                                        </div>
-                                    ))}
-                            </div>
+                                        ))}
+                                </div>
+                            </Deferred>
 
                             <Button
                                 asChild
@@ -830,30 +886,35 @@ export default function Dashboard({
                                 Most active users in the last {period}.
                             </h3>
 
-                            <div className="mb-8 space-y-2">
-                                {active_users
-                                    ?.slice(0, 3)
-                                    .map((u: any, i: number) => (
-                                        <div
-                                            key={i}
-                                            className="flex items-center justify-between rounded-xl border-b border-border/50 p-3 transition-all last:border-none hover:bg-muted/30"
-                                        >
-                                            <div className="min-w-0">
-                                                <div className="truncate text-sm font-black text-foreground">
-                                                    {u.user_identifier}
+                            <Deferred
+                                data="active_users"
+                                fallback={<UserRowsSkeleton rows={3} />}
+                            >
+                                <div className="mb-8 space-y-2">
+                                    {active_users
+                                        ?.slice(0, 3)
+                                        .map((u: any, i: number) => (
+                                            <div
+                                                key={i}
+                                                className="flex items-center justify-between rounded-xl border-b border-border/50 p-3 transition-all last:border-none hover:bg-muted/30"
+                                            >
+                                                <div className="min-w-0">
+                                                    <div className="truncate text-sm font-black text-foreground">
+                                                        {u.user_identifier}
+                                                    </div>
+                                                    <div className="truncate text-[10px] text-muted-foreground opacity-60">
+                                                        {u.user_email ||
+                                                            (u.user_id &&
+                                                                `ID: ${u.user_id}`)}
+                                                    </div>
                                                 </div>
-                                                <div className="truncate text-[10px] text-muted-foreground opacity-60">
-                                                    {u.user_email ||
-                                                        (u.user_id &&
-                                                            `ID: ${u.user_id}`)}
+                                                <div className="text-xs font-black text-foreground/80">
+                                                    {u.request_count}
                                                 </div>
                                             </div>
-                                            <div className="text-xs font-black text-foreground/80">
-                                                {u.request_count}
-                                            </div>
-                                        </div>
-                                    ))}
-                            </div>
+                                        ))}
+                                </div>
+                            </Deferred>
 
                             <Button
                                 asChild
@@ -879,7 +940,10 @@ export default function Dashboard({
                                         </div>
                                     </div>
                                 </div>
-                                <div className="h-[80px] w-full">
+                                <ChartFrame
+                                    ready={Boolean(timeSeries)}
+                                    height="h-[80px]"
+                                >
                                     <ResponsiveContainer
                                         width="100%"
                                         height="100%"
@@ -931,7 +995,7 @@ export default function Dashboard({
                                             />
                                         </BarChart>
                                     </ResponsiveContainer>
-                                </div>
+                                </ChartFrame>
                             </Card>
 
                             <Card className="border-border bg-card p-6 shadow-2xl">
@@ -963,7 +1027,10 @@ export default function Dashboard({
                                         </div>
                                     </div>
                                 </div>
-                                <div className="h-[80px] w-full">
+                                <ChartFrame
+                                    ready={Boolean(timeSeries)}
+                                    height="h-[80px]"
+                                >
                                     <ResponsiveContainer
                                         width="100%"
                                         height="100%"
@@ -1035,7 +1102,7 @@ export default function Dashboard({
                                             />
                                         </BarChart>
                                     </ResponsiveContainer>
-                                </div>
+                                </ChartFrame>
                             </Card>
                         </div>
                     </div>

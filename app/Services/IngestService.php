@@ -53,7 +53,7 @@ class IngestService
                     'type' => $type,
                     'payload' => $data,
                     'fingerprint' => $this->calculateFingerprint($type, $data),
-                    'user_key' => $this->rollupWriter->rawUserKeyFor($data),
+                    'user_key' => $this->rollupWriter->rawUserKeyFor($type, $data),
                     'ip' => $this->rollupWriter->ipFor($data),
                     'trace_id' => $this->rollupWriter->traceIdFor($data),
                     'message' => $this->rollupWriter->messageFor($type, $data),

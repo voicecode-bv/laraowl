@@ -1,6 +1,22 @@
 import { router } from '@inertiajs/react';
 import { useEffect, useRef } from 'react';
 
+/**
+ * Shared props that describe the workspace rather than the telemetry on
+ * screen: the signed-in user, their teams and projects, and the update
+ * banner. A live reload fires as often as data is ingested, and each one of
+ * these costs a query while never changing between two ticks, so they are
+ * left out of the partial reload and keep the value they already have.
+ */
+const WORKSPACE_PROPS = [
+    'auth',
+    'teams',
+    'projects',
+    'currentTeam',
+    'currentProject',
+    'update',
+] as const;
+
 export function useLiveReload(
     projectId: number | string | undefined,
     intervalMs = 5000,
@@ -15,7 +31,7 @@ export function useLiveReload(
 
         const reload = () => {
             lastReloadAt.current = Date.now();
-            router.reload({ preserveScroll: true, preserveState: true } as any);
+            router.reload({ except: [...WORKSPACE_PROPS] });
         };
 
         const schedule = () => {

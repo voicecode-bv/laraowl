@@ -36,7 +36,6 @@ export default function QueriesIndex({
 }: {
     queries: any;
     timeSeries: any;
-    stats: any;
     overview: any;
     period?: string | null;
     from?: string | null;

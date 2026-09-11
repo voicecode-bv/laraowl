@@ -33,6 +33,31 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Dashboard Cache
+    |--------------------------------------------------------------------------
+    |
+    | Every viewer of a project reloads on each ingest tick, and they all ask
+    | the rollups for the same numbers over the same period. Those answers can
+    | be shared for a few seconds instead of being recomputed per request.
+    |
+    | Left unset, this turns itself on only when the cache store is one the
+    | workers share and that is quicker to ask than the database — Redis,
+    | Memcached, DynamoDB or Octane. On the `database` store a cache read is
+    | another query against the same database, so it stays off. Set
+    | LARAOWL_DASHBOARD_CACHE to decide it yourself, and LARAOWL_DASHBOARD_CACHE_TTL
+    | to trade freshness for load: it is how many seconds old a dashboard
+    | number may be.
+    |
+    */
+
+    'dashboard_cache' => [
+        'enabled' => env('LARAOWL_DASHBOARD_CACHE'),
+        'store' => env('LARAOWL_DASHBOARD_CACHE_STORE'),
+        'ttl' => (int) env('LARAOWL_DASHBOARD_CACHE_TTL', 10),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Update Binaries
     |--------------------------------------------------------------------------
     |

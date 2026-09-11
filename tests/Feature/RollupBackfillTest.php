@@ -5,6 +5,7 @@ use App\Models\Record;
 use App\Models\RecordRollup;
 use App\Models\RecordUserBucket;
 use App\Services\IngestService;
+use Illuminate\Support\Facades\DB;
 
 function rollupSnapshot(Project $project): array
 {
@@ -135,4 +136,52 @@ test('the backfill buckets a record by the minute it was created', function () {
 
     expect($rollup->bucket->format('Y-m-d H:i:s'))
         ->toBe($createdAt->copy()->startOfMinute()->format('Y-m-d H:i:s'));
+});
+
+test('the command keys existing user records by their payload id', function () {
+    $project = Project::factory()->create();
+
+    Record::create([
+        'project_id' => $project->id,
+        'type' => 'user',
+        'payload' => ['t' => 'user', 'id' => 321, 'name' => 'Ada Lovelace'],
+        'created_at' => now()->subMinutes(5),
+    ]);
+
+    $this->artisan('laraowl:rollups:backfill')->assertExitCode(0);
+
+    expect(Record::where('project_id', $project->id)->value('user_key'))->toBe('321');
+});
+
+test('the migration keys user records that were ingested before they were keyed', function () {
+    $project = Project::factory()->create();
+
+    $keyed = DB::table('records')->insertGetId([
+        'project_id' => $project->id,
+        'type' => 'user',
+        'payload' => json_encode(['t' => 'user', 'id' => 654, 'name' => 'Grace Hopper']),
+        'created_at' => now(),
+    ]);
+
+    $anonymous = DB::table('records')->insertGetId([
+        'project_id' => $project->id,
+        'type' => 'user',
+        'payload' => json_encode(['t' => 'user', 'name' => 'Nobody']),
+        'created_at' => now(),
+    ]);
+
+    $request = DB::table('records')->insertGetId([
+        'project_id' => $project->id,
+        'type' => 'request',
+        'payload' => json_encode(['t' => 'request', 'status_code' => 200]),
+        'created_at' => now(),
+    ]);
+
+    $migration = require database_path('migrations/2026_09_11_072622_backfill_user_key_on_user_records.php');
+    $migration->up();
+
+    expect(DB::table('records')->where('id', $keyed)->value('user_key'))->toBe('654')
+        ->and(DB::table('records')->where('id', $anonymous)->value('user_key'))->toBeNull()
+        // Only user records carry their identifier at the payload root.
+        ->and(DB::table('records')->where('id', $request)->value('user_key'))->toBeNull();
 });

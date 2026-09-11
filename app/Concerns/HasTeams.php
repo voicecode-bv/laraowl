@@ -119,12 +119,26 @@ trait HasTeams
 
     /**
      * Get the user's role on the given team.
+     *
+     * Resolved without a query per team: a team loaded through `teams()`
+     * carries the membership row as its pivot, and anything else is answered
+     * from the user's memberships relation, which Eloquent loads once and
+     * then caches for the rest of the request. This runs for every team in
+     * the sidebar switcher on every page load, so the per-team query it used
+     * to issue was an N+1 on the shared Inertia props.
      */
     public function teamRole(Team $team): ?TeamRole
     {
-        return $this->teamMemberships()
-            ->where('team_id', $team->id)
-            ->first()
+        $pivot = $team->getAttribute('pivot');
+
+        if ($pivot && (int) $pivot->getAttribute('user_id') === (int) $this->getKey()) {
+            $role = $pivot->getAttribute('role');
+
+            return $role instanceof TeamRole ? $role : TeamRole::tryFrom((string) $role);
+        }
+
+        return $this->teamMemberships
+            ->firstWhere('team_id', $team->id)
             ?->role;
     }
 

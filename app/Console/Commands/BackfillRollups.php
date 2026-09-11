@@ -127,7 +127,7 @@ class BackfillRollups extends Command
         $updates = $chunk
             ->map(fn (Record $record) => [
                 'id' => $record->id,
-                'user_key' => $rollupWriter->rawUserKeyFor($record->payload ?? []),
+                'user_key' => $rollupWriter->rawUserKeyFor($record->type, $record->payload ?? []),
                 'ip' => $rollupWriter->ipFor($record->payload ?? []),
                 'trace_id' => $rollupWriter->traceIdFor($record->payload ?? []),
                 'message' => $rollupWriter->messageFor($record->type, $record->payload ?? []),

@@ -139,11 +139,46 @@ trait BuildsRollupQueries
     }
 
     /**
-     * The chart key a grouped row belongs to.
+     * How wide one chart slot is for a period, and how many of them a full
+     * period holds.
+     *
+     * The rollups are written per minute, which is the right resolution for
+     * the hour view but 1440 points for the day view — far more than any
+     * chart on the screen draws, paid for in JSON on every page view. The day
+     * view is folded into quarter hours instead: 96 points, one per bar at
+     * the widths these charts render at.
+     *
+     * @return array{unit: string, step: int, count: int, format: string}
      */
-    private function seriesKey(string $value, bool $groupedByMinute): string
+    private function timeSeriesResolution(string $period): array
     {
-        return $groupedByMinute ? Carbon::parse($value)->format('H:i') : $value;
+        return match ($period) {
+            '24h' => ['unit' => 'minute', 'step' => 15, 'count' => 96, 'format' => 'H:i'],
+            '7d' => ['unit' => 'day', 'step' => 1, 'count' => 7, 'format' => 'm-d'],
+            '14d' => ['unit' => 'day', 'step' => 1, 'count' => 14, 'format' => 'm-d'],
+            '30d' => ['unit' => 'day', 'step' => 1, 'count' => 30, 'format' => 'm-d'],
+            default => ['unit' => 'minute', 'step' => 1, 'count' => 60, 'format' => 'H:i'],
+        };
+    }
+
+    /**
+     * The chart key a grouped row belongs to.
+     *
+     * Rows the query grouped by minute are floored onto the period's slot
+     * grid, so several of them can land in one chart bar; anything the query
+     * already grouped (a day, or an hour for a custom range) is its own key.
+     */
+    private function seriesKey(string $value, bool $groupedByMinute, string $period = '1h'): string
+    {
+        if (! $groupedByMinute) {
+            return $value;
+        }
+
+        $resolution = $this->timeSeriesResolution($period);
+
+        return Carbon::parse($value)
+            ->floorMinutes($resolution['step'])
+            ->format($resolution['format']);
     }
 
     /**
@@ -151,54 +186,83 @@ trait BuildsRollupQueries
      */
     protected function fillTimeSeriesGaps($results, string $period, ?string $from = null, ?string $to = null): array
     {
-        $data = [];
-        $now = now();
+        $keys = $period === 'custom'
+            ? $this->customRangeKeys($from, $to)
+            : $this->periodKeys($period);
 
-        $iterations = match ($period) {
-            '1h' => 60,
-            '24h' => 1440,
-            '7d' => 7,
-            '14d' => 14,
-            '30d' => 30,
-            default => 60,
-        };
+        return array_map(
+            fn (string $key): array => $results->get($key) ?? $this->emptySlot($key),
+            $keys,
+        );
+    }
 
-        $unit = match ($period) {
-            '7d', '14d', '30d' => 'day',
-            default => 'minute',
-        };
+    /**
+     * Every slot key a period covers, oldest first, aligned to the same grid
+     * the rows were floored onto.
+     *
+     * @return list<string>
+     */
+    private function periodKeys(string $period): array
+    {
+        ['unit' => $unit, 'step' => $step, 'count' => $count, 'format' => $format] = $this->timeSeriesResolution($period);
 
-        $dateFormat = match ($period) {
-            '7d', '14d', '30d' => 'm-d',
-            '24h' => 'H:i',
-            default => 'H:i',
-        };
+        $latest = $unit === 'day' ? now() : now()->floorMinutes($step);
+        $keys = [];
 
-        for ($i = $iterations - 1; $i >= 0; $i--) {
-            $time = (clone $now)->sub($unit, $i);
-            $key = $time->format($dateFormat);
-
-            if ($results->has($key)) {
-                $data[] = $results->get($key);
-            } else {
-                $data[] = [
-                    'minute' => $key,
-                    'total' => 0,
-                    'ok' => 0,
-                    'client_error' => 0,
-                    'server_error' => 0,
-                    'avg_duration' => 0,
-                    'hits' => 0,
-                    'misses' => 0,
-                    'writes' => 0,
-                    'active_users' => 0,
-                    'total_requests' => 0,
-                    'authed' => 0,
-                    'guest' => 0,
-                ];
-            }
+        for ($i = $count - 1; $i >= 0; $i--) {
+            $keys[] = $latest->copy()->sub($unit, $i * $step)->format($format);
         }
 
-        return $data;
+        return $keys;
+    }
+
+    /**
+     * The hourly slot keys of a custom range, matching the hour labels the
+     * query groups a custom range by. Capped at a month of hours so a wide
+     * range cannot turn into an unbounded payload.
+     *
+     * @return list<string>
+     */
+    private function customRangeKeys(?string $from, ?string $to): array
+    {
+        if (! $from || ! $to) {
+            return [];
+        }
+
+        $cursor = Carbon::parse($from)->startOfHour();
+        $end = Carbon::parse($to)->startOfHour();
+        $keys = [];
+
+        while ($cursor <= $end && count($keys) < 744) {
+            $keys[] = $cursor->format('Y-m-d H:00');
+            $cursor->addHour();
+        }
+
+        return $keys;
+    }
+
+    /**
+     * A zeroed slot, carrying every key the charts read so a gap cannot blow
+     * up on an undefined value.
+     *
+     * @return array<string, mixed>
+     */
+    private function emptySlot(string $key): array
+    {
+        return [
+            'minute' => $key,
+            'total' => 0,
+            'ok' => 0,
+            'client_error' => 0,
+            'server_error' => 0,
+            'avg_duration' => 0,
+            'hits' => 0,
+            'misses' => 0,
+            'writes' => 0,
+            'active_users' => 0,
+            'total_requests' => 0,
+            'authed' => 0,
+            'guest' => 0,
+        ];
     }
 }

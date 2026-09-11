@@ -368,11 +368,21 @@ class RollupWriter
     }
 
     /**
+     * The user a raw record belongs to, as stored in the indexed `user_key`
+     * column.
+     *
+     * A `user` record *is* the user, so its identifier sits at the payload
+     * root rather than under `user` like every other type. Keying those rows
+     * too is what lets the name/email lookup behind the user panels filter on
+     * the indexed column instead of on a JSON expression.
+     *
      * @param  array<string, mixed>  $payload
      */
-    public function rawUserKeyFor(array $payload): ?string
+    public function rawUserKeyFor(string $type, array $payload): ?string
     {
-        $user = $payload['user'] ?? null;
+        $user = $type === 'user'
+            ? $payload['id'] ?? null
+            : $payload['user'] ?? null;
 
         if (is_array($user)) {
             $user = $user['id'] ?? null;

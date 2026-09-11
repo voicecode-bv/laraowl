@@ -66,6 +66,9 @@ test('user history resolves real email from user detail records', function () {
 
     $project->records()->create([
         'type' => 'user',
+        // Keyed like the ingest path does, because the detail lookup filters
+        // on the indexed column rather than on the JSON payload.
+        'user_key' => '789',
         'payload' => [
             't' => 'user',
             'id' => 789,
