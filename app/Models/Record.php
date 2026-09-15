@@ -87,6 +87,28 @@ class Record extends Model
         };
     }
 
+    /**
+     * The first calendar day a period's window covers.
+     *
+     * The daily rollups cannot open halfway through a day, so a period that
+     * {@see periodStartsAt()} opens at "30 x 24 hours ago" opens here on the
+     * first day the charts actually draw: `BuildsRollupQueries::periodKeys()`
+     * lays out 30 day labels ending today, so the window is today minus 29.
+     * Flooring the raw instant instead would pull in a 31st, partial day that
+     * no bar shows but every total would count.
+     */
+    public static function periodStartsAtDay(?string $period): CarbonInterface
+    {
+        $days = match ($period) {
+            '7d' => 7,
+            '14d' => 14,
+            '30d' => 30,
+            default => 1,
+        };
+
+        return now()->startOfDay()->subDays($days - 1);
+    }
+
     public function scopeFailed($query)
     {
         return $query->where(function ($q) {

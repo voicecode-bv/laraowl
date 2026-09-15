@@ -2,8 +2,22 @@
 
 namespace App\Concerns;
 
+use App\Models\Project;
+use App\Models\RecordDailyRollup;
+use App\Models\RecordGroupDailyRollup;
+use App\Models\RecordGroupRollup;
+use App\Models\RecordGroupUserBucket;
+use App\Models\RecordGroupUserDailyBucket;
+use App\Models\RecordIpBucket;
+use App\Models\RecordIpDailyBucket;
+use App\Models\RecordRollup;
+use App\Models\RecordUserBucket;
+use App\Models\RecordUserDailyBucket;
 use App\Services\RecordService;
+use App\Services\RollupCompactor;
+use App\Support\ProjectContext;
 use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -20,6 +34,87 @@ use Illuminate\Support\Facades\DB;
  */
 trait BuildsRollupQueries
 {
+    /**
+     * The daily counterpart of each fine-grained rollup table.
+     *
+     * The two sides are deliberately identical in shape — same columns, same
+     * meaning — so a read swaps one for the other and changes nothing else
+     * about its query. {@see RollupCompactor} is what keeps
+     * the right-hand side true.
+     *
+     * @var array<class-string, class-string>
+     */
+    private const DAILY_GRAIN = [
+        RecordRollup::class => RecordDailyRollup::class,
+        RecordGroupRollup::class => RecordGroupDailyRollup::class,
+        RecordUserBucket::class => RecordUserDailyBucket::class,
+        RecordGroupUserBucket::class => RecordGroupUserDailyBucket::class,
+        RecordIpBucket::class => RecordIpDailyBucket::class,
+    ];
+
+    /**
+     * Periods answered from the daily grain.
+     *
+     * These are the views whose chart slot already is a day, so folding
+     * minutes at read time only ever produced the row the compactor has
+     * written. The live views stay on the fine grain, where a bucket the
+     * compactor has not reached yet still has to show up; so does a custom
+     * range, which is drawn by the hour and can open mid-day.
+     */
+    private const DAILY_PERIODS = ['7d', '14d', '30d'];
+
+    /**
+     * Whether a scope's daily grain is folded far enough to be read from,
+     * memoised for the life of the service.
+     *
+     * @var array<string, bool>
+     */
+    private array $dailyGrainReady = [];
+
+    /**
+     * The table a rollup read should come from for this period.
+     *
+     * @template TModel of \Illuminate\Database\Eloquent\Model
+     *
+     * @param  class-string<TModel>  $model  the fine-grained model
+     * @return class-string<TModel>
+     */
+    protected function rollupSource(string $model, ?string $period, ProjectContext $project): string
+    {
+        if (! in_array($period, self::DAILY_PERIODS, true) || ! $this->dailyGrainIsCurrent($project)) {
+            return $model;
+        }
+
+        return self::DAILY_GRAIN[$model] ?? $model;
+    }
+
+    /**
+     * Whether every project in scope has been folded up to yesterday.
+     *
+     * The daily grain is an optimisation, not a second source of truth, so a
+     * read only uses it while it is known to be complete. A project the
+     * compactor has never reached — a fresh install, a deployment where the
+     * schedule is not running yet — or one it has fallen days behind on
+     * sends the whole scope back to the fine grain, which is slower and
+     * right, and back again on its own once the next pass catches up.
+     *
+     * Yesterday is the bar because a pass rebuilds the current day as well
+     * without marking it complete, so a project folded through yesterday has
+     * today's partial row too.
+     */
+    private function dailyGrainIsCurrent(ProjectContext $project): bool
+    {
+        $ids = $project->projectIds();
+        $key = implode(',', $ids);
+
+        return $this->dailyGrainReady[$key] ??= ! Project::query()
+            ->whereIn('id', $ids)
+            ->where(fn (EloquentBuilder $query) => $query
+                ->whereNull('rollups_compacted_through')
+                ->orWhere('rollups_compacted_through', '<', now()->startOfDay()->subDay()))
+            ->exists();
+    }
+
     private function jsonPathSegments(string $path): array
     {
         return explode('.', $path);

@@ -37,6 +37,13 @@ class UptimeCheck extends Model
      * Shares its period vocabulary with the telemetry screens
      * ({@see Record::periodStartsAt()}) so "24h" means the same thing on
      * every card, and `all` deliberately spans the whole retained history.
+     *
+     * The multi-day periods open on a calendar day rather than that many
+     * times 24 hours back. The availability chart has always drawn them as
+     * day-wide bars, so a rolling window put a 31st, partial day into the
+     * summary beside it that no bar accounted for — and it is the day
+     * boundary that {@see UptimeDailyRollup} folds to, so aligning here is
+     * what lets the folded days answer for the raw checks exactly.
      */
     public function scopeForPeriod(Builder $query, ?string $period, ?string $from = null, ?string $to = null): Builder
     {
@@ -48,6 +55,10 @@ class UptimeCheck extends Model
             return $query->whereBetween('checked_at', [$from, $to]);
         }
 
-        return $query->where('checked_at', '>=', Record::periodStartsAt($period));
+        $opensAt = in_array($period, ['7d', '14d', '30d'], true)
+            ? Record::periodStartsAtDay($period)
+            : Record::periodStartsAt($period);
+
+        return $query->where('checked_at', '>=', $opensAt);
     }
 }

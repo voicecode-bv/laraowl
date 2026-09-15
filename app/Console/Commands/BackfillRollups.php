@@ -4,12 +4,19 @@ namespace App\Console\Commands;
 
 use App\Models\Project;
 use App\Models\Record;
+use App\Models\RecordDailyRollup;
+use App\Models\RecordGroupDailyRollup;
 use App\Models\RecordGroupRollup;
 use App\Models\RecordGroupUserBucket;
+use App\Models\RecordGroupUserDailyBucket;
 use App\Models\RecordIpBucket;
+use App\Models\RecordIpDailyBucket;
 use App\Models\RecordRollup;
 use App\Models\RecordUserBucket;
+use App\Models\RecordUserDailyBucket;
+use App\Services\RollupCompactor;
 use App\Services\RollupWriter;
+use Carbon\Carbon;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
@@ -54,6 +61,13 @@ class BackfillRollups extends Command
 
         $this->newLine();
         $this->info('Rollups rebuilt.');
+
+        // A rebuild rewrites the minute buckets the daily grain was folded
+        // from, so the days covering them are stale until they are folded
+        // again. `RollupWriter` has already wound each project's watermark
+        // back to the oldest record it rewrote, so a plain pass picks up
+        // exactly the days that moved.
+        $this->call('laraowl:rollups:compact');
 
         return self::SUCCESS;
     }
@@ -174,9 +188,17 @@ class BackfillRollups extends Command
 
     /**
      * Clear the range being rebuilt, so a re-run cannot accumulate.
+     *
+     * The compaction watermark is wound back past the range as well. Ingest
+     * winds it back on its own when it writes behind it, but only for records
+     * it actually writes: a rebuild that finds fewer records than last time —
+     * or none at all, because they were deleted — would otherwise leave the
+     * folded days reporting rows that no longer exist.
      */
     protected function discardExistingRollups(Project $project, ?string $since, ?string $until): void
     {
+        $this->rewindCompaction($project, $since);
+
         $tables = [
             RecordRollup::query(),
             RecordGroupRollup::query(),
@@ -191,6 +213,55 @@ class BackfillRollups extends Command
                 ->when($until, fn (Builder $builder) => $builder->where('bucket', '<', $until))
                 ->delete();
         }
+
+        $this->discardFoldedDays($project, $since, $until);
+    }
+
+    /**
+     * Drop the folded days covering the range, so the pass that follows
+     * rebuilds them from what the rebuild actually wrote.
+     *
+     * {@see RollupCompactor::compactDay()} deliberately leaves a day alone
+     * when its source buckets fold to nothing, because that is what a pruned
+     * day looks like and those days have to survive their sources. A rebuild
+     * is the one case where an empty fold means the day really is empty, and
+     * it is the caller that knows the difference.
+     *
+     * Bounds are widened to whole days: a range opening mid-day still owns
+     * part of that day's folded row, which the next pass rebuilds from the
+     * buckets on either side of the boundary.
+     */
+    protected function discardFoldedDays(Project $project, ?string $since, ?string $until): void
+    {
+        $tables = [
+            RecordDailyRollup::query(),
+            RecordGroupDailyRollup::query(),
+            RecordUserDailyBucket::query(),
+            RecordGroupUserDailyBucket::query(),
+            RecordIpDailyBucket::query(),
+        ];
+
+        foreach ($tables as $query) {
+            $query->where('project_id', $project->id)
+                ->when($since, fn (Builder $builder) => $builder->where('bucket', '>=', Carbon::parse($since)->startOfDay()))
+                ->when($until, fn (Builder $builder) => $builder->where('bucket', '<=', Carbon::parse($until)->startOfDay()))
+                ->delete();
+        }
+    }
+
+    /**
+     * Mark the days covering the rebuilt range as unfolded.
+     */
+    protected function rewindCompaction(Project $project, ?string $since): void
+    {
+        $watermark = $since ? Carbon::parse($since)->startOfDay()->subDay() : null;
+
+        if ($project->rollups_compacted_through === null
+            || ($watermark !== null && $project->rollups_compacted_through->lessThanOrEqualTo($watermark))) {
+            return;
+        }
+
+        $project->forceFill(['rollups_compacted_through' => $watermark])->saveQuietly();
     }
 
     /**

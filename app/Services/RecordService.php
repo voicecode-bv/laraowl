@@ -11,7 +11,9 @@ use App\Models\RecordGroupUserBucket;
 use App\Models\RecordIpBucket;
 use App\Models\RecordRollup;
 use App\Models\RecordUserBucket;
+use App\Models\RecordUserDailyBucket;
 use App\Models\UptimeCheck;
+use App\Models\UptimeDailyRollup;
 use App\Support\ProjectContext;
 use App\Support\RollupCache;
 use Carbon\Carbon;
@@ -56,7 +58,7 @@ class RecordService
     {
         $types = ['request', 'exception', 'query', 'queued-job', 'job-attempt', 'scheduled-task', 'cache-event', 'log', 'mail', 'notification', 'outgoing-request'];
 
-        $counts = RecordRollup::query()
+        $counts = $this->rollupSource(RecordRollup::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereIn('type', $types)
             ->forPeriod($period, $from, $to)
@@ -293,7 +295,7 @@ class RecordService
         $isRequest = $this->col('type')." = 'request'";
         $isException = $this->col('type')." = 'exception'";
 
-        $usersQuery = RecordUserBucket::query()
+        $usersQuery = $this->rollupSource(RecordUserBucket::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->forPeriod($period, $from, $to)
             ->select([
@@ -371,7 +373,7 @@ class RecordService
 
         $exceptions = $this->groupList($project, 'exception', $period, $from, $to, sort: 'last_seen');
 
-        $userCounts = RecordGroupUserBucket::query()
+        $userCounts = $this->rollupSource(RecordGroupUserBucket::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->where('type', 'exception')
             ->whereIn('group_key', collect($exceptions->items())->pluck('hash')->all())
@@ -705,13 +707,20 @@ class RecordService
     /**
      * Searched over `record_user_buckets`, which holds one row per user per
      * hour rather than one per record.
+     *
+     * The hash on a link can outlive the hour buckets it was minted from —
+     * they are kept for a shorter window than the daily grain the long
+     * periods read — so a miss falls through to the daily buckets rather than
+     * reporting a user that is still on the screen as unknown.
      */
     protected function resolveUserKeyFromHash(ProjectContext $project, string $hash): ?string
     {
-        return RecordUserBucket::query()
+        $lookup = fn (string $model): ?string => $model::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereRaw('MD5('.$this->col('user_key').') = ?', [$hash])
             ->value('user_key');
+
+        return $lookup(RecordUserBucket::class) ?? $lookup(RecordUserDailyBucket::class);
     }
 
     /**
@@ -913,7 +922,7 @@ class RecordService
     {
         $status = $this->jsonText('status');
 
-        $uniqueIps = RecordIpBucket::query()
+        $uniqueIps = $this->rollupSource(RecordIpBucket::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->where('type', 'request')
             ->forPeriod($period, $from, $to)
@@ -1005,7 +1014,7 @@ class RecordService
 
         $sum = fn (string $column, string $alias) => DB::raw('SUM('.$this->col($column).') as '.$alias);
 
-        $results = RecordRollup::query()
+        $results = $this->rollupSource(RecordRollup::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereIn('type', $types)
             ->forPeriod($period, $from, $to)
@@ -1028,7 +1037,7 @@ class RecordService
 
         $userBucket = $groupsByMinute ? $this->col('bucket') : $bucket;
 
-        $activeUsers = RecordUserBucket::query()
+        $activeUsers = $this->rollupSource(RecordUserBucket::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereIn('type', $types)
             ->forPeriod($period, $from, $to)
@@ -1226,6 +1235,79 @@ class RecordService
     }
 
     /**
+     * Whether the uptime reads can come from the folded days.
+     *
+     * The availability chart draws one bar per day over these periods, which
+     * is exactly one row of `uptime_daily_rollups`, against the roughly 2,880
+     * raw checks a day of thirty-second polling leaves behind. It defers to
+     * the same currency check as the telemetry rollups, so a scope the
+     * compactor has not caught up with reads the raw checks instead.
+     */
+    private function uptimeUsesDailyGrain(ProjectContext $project, ?string $period): bool
+    {
+        return $this->rollupSource(RecordRollup::class, $period, $project) !== RecordRollup::class;
+    }
+
+    /**
+     * The summary aggregate, over whichever grain answers it.
+     *
+     * The average is carried as a sum and a count on both sides rather than
+     * as `AVG()` on one and a division on the other: an average is not
+     * additive, so the folded day has to keep both parts, and the raw side
+     * computes it the same way to stay provably equal to it.
+     *
+     * @return list<Expression|string>
+     */
+    private function uptimeTotalsColumns(bool $daily): array
+    {
+        $sum = fn (string $column, string $alias) => DB::raw('COALESCE(SUM('.$this->col($column).'), 0) as '.$alias);
+
+        if ($daily) {
+            return [
+                $sum('checks', 'total_checks'),
+                $sum('up_checks', 'up_checks'),
+                $sum('sum_response_time', 'sum_response_time'),
+                $sum('response_count', 'response_count'),
+                DB::raw('MAX('.$this->col('last_checked_at').') as last_check'),
+            ];
+        }
+
+        return [
+            DB::raw('COUNT(*) as total_checks'),
+            DB::raw('SUM(CASE WHEN '.$this->col('status')." = 'up' THEN 1 ELSE 0 END) as up_checks"),
+            DB::raw('COALESCE(SUM('.$this->col('response_time').'), 0) as sum_response_time'),
+            DB::raw('COUNT('.$this->col('response_time').') as response_count'),
+            DB::raw('MAX('.$this->col('checked_at').') as last_check'),
+        ];
+    }
+
+    /**
+     * The per-slot aggregate behind the availability chart.
+     *
+     * @return list<Expression>
+     */
+    private function uptimeSeriesColumns(bool $daily): array
+    {
+        $sum = fn (string $column, string $alias) => DB::raw('COALESCE(SUM('.$this->col($column).'), 0) as '.$alias);
+
+        if ($daily) {
+            return [
+                $sum('checks', 'total'),
+                $sum('up_checks', 'up_count'),
+                $sum('sum_response_time', 'sum_response_time'),
+                $sum('response_count', 'response_count'),
+            ];
+        }
+
+        return [
+            DB::raw('COUNT(*) as total'),
+            DB::raw('SUM(CASE WHEN '.$this->col('status')." = 'up' THEN 1 ELSE 0 END) as up_count"),
+            DB::raw('COALESCE(SUM('.$this->col('response_time').'), 0) as sum_response_time'),
+            DB::raw('COUNT('.$this->col('response_time').') as response_count'),
+        ];
+    }
+
+    /**
      * The uptime screen: a page of checks plus the summary above it.
      *
      * Both read the selected period. The summary used to count, average and
@@ -1255,17 +1337,17 @@ class RecordService
             ->paginate(50)
             ->withQueryString();
 
-        $totals = UptimeCheck::query()
+        $daily = $this->uptimeUsesDailyGrain($project, $period);
+
+        $totals = ($daily ? UptimeDailyRollup::query() : UptimeCheck::query())
             ->whereIn('project_id', $project->projectIds())
             ->forPeriod($period, $from, $to)
-            ->selectRaw('COUNT(*) as total_checks')
-            ->selectRaw('SUM(CASE WHEN '.$this->col('status')." = 'up' THEN 1 ELSE 0 END) as up_checks")
-            ->selectRaw('AVG('.$this->col('response_time').') as avg_response_time')
-            ->selectRaw('MAX('.$this->col('checked_at').') as last_check')
+            ->select($this->uptimeTotalsColumns($daily))
             ->toBase()
             ->first();
 
         $totalChecks = (int) ($totals->total_checks ?? 0);
+        $responseCount = (int) ($totals->response_count ?? 0);
         $lastCheck = $totals->last_check ?? null;
 
         return [
@@ -1274,7 +1356,9 @@ class RecordService
                 'uptime_percentage' => $totalChecks > 0
                     ? round(((int) $totals->up_checks / $totalChecks) * 100, 2)
                     : 100,
-                'avg_response_time' => round((float) ($totals->avg_response_time ?? 0), 2),
+                'avg_response_time' => $responseCount > 0
+                    ? round((float) $totals->sum_response_time / $responseCount, 2)
+                    : 0.0,
                 'last_check' => $lastCheck ? Carbon::parse($lastCheck)->toIso8601String() : null,
                 'total_checks' => $totalChecks,
             ],
@@ -1328,19 +1412,19 @@ class RecordService
             return ['projects' => [], 'series' => [], 'omitted' => 0];
         }
 
-        $slot = $this->timeSlotSql($period, 'checked_at');
+        $daily = $this->uptimeUsesDailyGrain($project, $period);
 
-        $rows = UptimeCheck::query()
+        $slot = $daily
+            ? $this->timeBucketSql($period, 'bucket')
+            : $this->timeSlotSql($period, 'checked_at');
+
+        $rows = ($daily ? UptimeDailyRollup::query() : UptimeCheck::query())
             ->whereIn('project_id', $monitored->modelKeys())
             ->forPeriod($period, $from, $to)
-            ->select([
-                'project_id',
-                DB::raw("{$slot} as slot"),
-                DB::raw('COUNT(*) as total'),
-                DB::raw('SUM(CASE WHEN '.$this->col('status')." = 'up' THEN 1 ELSE 0 END) as up_count"),
-                DB::raw('SUM('.$this->col('response_time').') as sum_response_time'),
-                DB::raw('COUNT('.$this->col('response_time').') as response_count'),
-            ])
+            ->select(array_merge(
+                ['project_id', DB::raw("{$slot} as slot")],
+                $this->uptimeSeriesColumns($daily),
+            ))
             ->groupBy('project_id', 'slot')
             ->toBase()
             ->get();
@@ -1499,7 +1583,7 @@ class RecordService
      */
     protected function rollupCount(ProjectContext $project, string|array $types, ?string $period, ?string $from, ?string $to): int
     {
-        return (int) RecordRollup::query()
+        return (int) $this->rollupSource(RecordRollup::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereIn('type', (array) $types)
             ->forPeriod($period, $from, $to)
@@ -1511,7 +1595,7 @@ class RecordService
      */
     protected function distinctGroups(ProjectContext $project, string|array $types, ?string $period, ?string $from, ?string $to, string $column = 'group_key'): int
     {
-        return RecordGroupRollup::query()
+        return $this->rollupSource(RecordGroupRollup::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereIn('type', (array) $types)
             ->forPeriod($period, $from, $to)
@@ -1526,7 +1610,7 @@ class RecordService
      */
     protected function rollupTotals(ProjectContext $project, string|array $types, ?string $period = null, ?string $from = null, ?string $to = null): object
     {
-        return RecordRollup::query()
+        return $this->rollupSource(RecordRollup::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereIn('type', (array) $types)
             ->forPeriod($period, $from, $to)
@@ -1559,7 +1643,7 @@ class RecordService
 
         $case .= ' END';
 
-        $rows = RecordRollup::query()
+        $rows = $this->rollupSource(RecordRollup::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereIn('type', array_merge(...array_values($groups)))
             ->forPeriod($period, $from, $to)
@@ -1720,7 +1804,7 @@ class RecordService
 
         $orderBy = $sortMap[$sort] ?? $sort;
 
-        $groups = RecordGroupRollup::query()
+        $groups = $this->rollupSource(RecordGroupRollup::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->whereIn('type', (array) $types)
             ->forPeriod($period, $from, $to)
@@ -1748,7 +1832,7 @@ class RecordService
      */
     protected function topUsers(ProjectContext $project, string $type, string $countAlias, ?string $period = null, ?string $from = null, ?string $to = null)
     {
-        return RecordUserBucket::query()
+        return $this->rollupSource(RecordUserBucket::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->where('type', $type)
             ->forPeriod($period, $from, $to)
@@ -1770,7 +1854,7 @@ class RecordService
      */
     protected function distinctUsers(ProjectContext $project, string|array|null $types = null, ?string $period = null, ?string $from = null, ?string $to = null): int
     {
-        return RecordUserBucket::query()
+        return $this->rollupSource(RecordUserBucket::class, $period, $project)::query()
             ->whereIn('project_id', $project->projectIds())
             ->when($types !== null, fn ($query) => $query->whereIn('type', (array) $types))
             ->forPeriod($period, $from, $to)

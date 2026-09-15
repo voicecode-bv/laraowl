@@ -80,10 +80,17 @@ class RollupWriter
         $userBuckets = [];
         $ipBuckets = [];
 
+        $oldestSeenAt = null;
+
         foreach ($batch as $entry) {
             $type = $entry['type'];
             $payload = $entry['payload'];
             $seenAt = $entry['created_at'];
+
+            if ($oldestSeenAt === null || $seenAt->lessThan($oldestSeenAt)) {
+                $oldestSeenAt = $seenAt;
+            }
+
             $bucket = $this->bucketFor($seenAt);
             $hour = $this->hourFor($seenAt);
             $deltas = $this->deltasFor($type, $payload);
@@ -200,6 +207,47 @@ class RollupWriter
         if ($groupUsers !== []) {
             DB::table('record_group_user_buckets')->insertOrIgnore(array_values($groupUsers));
         }
+
+        $this->rewindCompaction($project, $oldestSeenAt);
+    }
+
+    /**
+     * Wind the compaction watermark back when a batch writes behind it.
+     *
+     * {@see RollupCompactor} folds a day once and trusts it to stay folded,
+     * which only holds while records arrive in order. A client that was
+     * offline, a replayed queue, or a backfill can write into a day that was
+     * already folded, and the daily rollup would keep reporting the totals
+     * from before those records existed. Marking the day unfolded is enough:
+     * the next pass rebuilds it from the minute buckets that now include them.
+     *
+     * Ordinary ingest is always ahead of the watermark and returns on the
+     * comparison, without touching the database. The update is conditional so
+     * that concurrent workers can only ever move the watermark backwards,
+     * never undo each other's rewind.
+     */
+    protected function rewindCompaction(Project $project, ?CarbonInterface $oldestSeenAt): void
+    {
+        $compactedThrough = $project->rollups_compacted_through;
+
+        if ($compactedThrough === null || $oldestSeenAt === null) {
+            return;
+        }
+
+        $day = $oldestSeenAt->copy()->startOfDay();
+
+        if ($day->greaterThan($compactedThrough)) {
+            return;
+        }
+
+        $rewound = $day->copy()->subDay();
+
+        Project::query()
+            ->whereKey($project->id)
+            ->where('rollups_compacted_through', '>', $rewound)
+            ->update(['rollups_compacted_through' => $rewound]);
+
+        $project->setAttribute('rollups_compacted_through', $rewound)->syncOriginalAttribute('rollups_compacted_through');
     }
 
     /**

@@ -61,8 +61,10 @@ test('the uptime summary is a single aggregate query', function () {
     // not a count, a filtered count, an average and a sort over the table.
     $summaryQueries = collect($queries)->filter(fn (string $sql) => str_contains($sql, 'uptime_checks'));
 
+    // The average is read as a sum and a count so that the same figure can be
+    // summed out of the folded days, which have no rows left to average.
     expect($summaryQueries)->toHaveCount(3)
-        ->and($summaryQueries->filter(fn (string $sql) => str_contains(strtolower($sql), 'avg(')))->toHaveCount(1);
+        ->and($summaryQueries->filter(fn (string $sql) => str_contains($sql, 'sum_response_time') && str_contains($sql, 'response_count')))->toHaveCount(1);
 });
 
 test('a project without uptime monitoring answers with an empty summary', function () {

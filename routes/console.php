@@ -13,5 +13,9 @@ Schedule::command('projects:check-health')
     ->everyThirtySeconds()
     ->withoutOverlapping(5)
     ->runInBackground();
+Schedule::command('laraowl:rollups:compact')
+    ->everyFifteenMinutes()
+    ->withoutOverlapping(30)
+    ->runInBackground();
 Schedule::command('model:prune')->daily();
 Schedule::command('laraowl:update --check')->daily();

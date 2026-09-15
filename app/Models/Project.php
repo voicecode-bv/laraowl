@@ -48,6 +48,7 @@ class Project extends Model implements HasMedia, ProjectContext
         'last_uptime_status',
         'retention_days',
         'rollup_retention_days',
+        'daily_rollup_retention_days',
         'settings',
     ];
 
@@ -75,6 +76,7 @@ class Project extends Model implements HasMedia, ProjectContext
     protected $casts = [
         'settings' => 'array',
         'last_uptime_check_at' => 'datetime',
+        'rollups_compacted_through' => 'datetime',
         'uptime_monitoring_enabled' => 'boolean',
     ];
 
