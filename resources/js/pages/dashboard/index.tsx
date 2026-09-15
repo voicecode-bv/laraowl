@@ -4,6 +4,7 @@ import {
     Activity as ActivityIcon,
     AlertCircle,
     ArrowUpRight,
+    Globe,
     LayoutGrid,
     Users as UsersIcon,
     Plus,
@@ -22,6 +23,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
+import { UptimeChart } from '@/components/uptime-chart';
 import { useLiveReload } from '@/hooks/use-live-reload';
 import AppLayout from '@/layouts/app-layout';
 import { appendMonitoringQuery } from '@/lib/monitoring-query';
@@ -74,6 +76,7 @@ export default function Dashboard({
     auth_users_count,
     guest_users_count,
     uptime_status,
+    uptime_series,
     period,
     from,
     to,
@@ -321,6 +324,49 @@ export default function Dashboard({
                         </Card>
                     )}
                 </div>
+
+                {/* Section: Availability, across every application */}
+                {isAggregate && (
+                    <section className="space-y-4">
+                        <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2 text-xs font-black tracking-widest text-foreground uppercase">
+                                <div className="rounded-md border border-border bg-muted p-1.5">
+                                    <Globe className="size-3.5 text-muted-foreground" />
+                                </div>
+                                Availability
+                            </div>
+                            <Button
+                                asChild
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 gap-2 bg-muted text-[10px] font-black tracking-widest uppercase hover:bg-muted/80"
+                            >
+                                <Link href={monitoringHref('uptime')}>
+                                    Uptime <ArrowUpRight className="size-3" />
+                                </Link>
+                            </Button>
+                        </div>
+
+                        <Card className="overflow-hidden border-border bg-card shadow-2xl">
+                            <CardContent className="p-8">
+                                <Deferred
+                                    data="uptime_series"
+                                    fallback={
+                                        <div className="space-y-6">
+                                            <Skeleton className="h-[280px] w-full" />
+                                            <Skeleton className="h-8 w-2/3" />
+                                        </div>
+                                    }
+                                >
+                                    <UptimeChart
+                                        series={uptime_series}
+                                        period={period}
+                                    />
+                                </Deferred>
+                            </CardContent>
+                        </Card>
+                    </section>
+                )}
 
                 {/* Section: Activity */}
                 <section className="space-y-4">

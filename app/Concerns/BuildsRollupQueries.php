@@ -120,6 +120,36 @@ trait BuildsRollupQueries
     }
 
     /**
+     * The exact chart slot key a timestamp column belongs to, computed in SQL.
+     *
+     * {@see timeBucketSql()} formats a row; this floors it onto the grid the
+     * charts actually draw, which matters for a raw timestamp column such as
+     * `uptime_checks.checked_at`. Grouping a day of per-minute checks by
+     * `HH:MI` returns 1440 rows per project for a chart that draws 96 bars;
+     * flooring to the period's step returns exactly one row per bar. Periods
+     * whose bucket already is one slot (the hour view, the day views, a
+     * custom range) fall through to the plain format.
+     */
+    private function timeSlotSql(string $period, string $column): string
+    {
+        ['unit' => $unit, 'step' => $step] = $this->timeSeriesResolution($period);
+
+        if ($period === 'custom' || $unit === 'day' || $step === 1) {
+            return $this->timeBucketSql($period, $column);
+        }
+
+        $seconds = $step * 60;
+        $driver = DB::connection()->getDriverName();
+
+        return match ($driver) {
+            'pgsql' => "to_char(to_timestamp(FLOOR(EXTRACT(EPOCH FROM {$column}) / {$seconds}) * {$seconds}) AT TIME ZONE 'UTC', 'HH24:MI')",
+            'mysql', 'mariadb' => "DATE_FORMAT(FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP({$column}) / {$seconds}) * {$seconds}), '%H:%i')",
+            'sqlite' => "strftime('%H:%M', datetime(CAST(strftime('%s', {$column}) / {$seconds} AS INTEGER) * {$seconds}, 'unixepoch'))",
+            default => throw new \RuntimeException("Unsupported database driver for time-bucket formatting: {$driver}"),
+        };
+    }
+
+    /**
      * Quote an identifier for the active driver.
      */
     private function col(string $name): string

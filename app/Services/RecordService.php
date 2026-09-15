@@ -30,6 +30,15 @@ class RecordService
 {
     use BuildsRollupQueries;
 
+    /**
+     * How many applications the aggregate uptime chart draws a line for.
+     *
+     * Bounded by the categorical palette: eight hues that stay apart from one
+     * another, colour-vision deficiencies included. A ninth line would have to
+     * reuse a hue, which is worse than leaving it off the chart.
+     */
+    private const UPTIME_SERIES_LIMIT = 8;
+
     public function __construct(private readonly RollupCache $cache) {}
 
     /**
@@ -1270,6 +1279,152 @@ class RecordService
                 'total_checks' => $totalChecks,
             ],
         ];
+    }
+
+    /**
+     * Per-application availability over the selected period, for the chart
+     * the "All" scope renders on the dashboard.
+     *
+     * One grouped read over `uptime_checks` answers every line on the chart:
+     * the rows come back already floored onto the chart's own slot grid
+     * ({@see timeSlotSql()}), so a day of per-minute checks is 96 rows per
+     * project rather than 1440, and the period totals under the legend are
+     * folded out of those same rows instead of costing a second aggregate.
+     *
+     * Only monitored projects are read, and only the
+     * {@see self::UPTIME_SERIES_LIMIT} least available of them are charted —
+     * past that the lines run out of colours to be told apart by. `omitted`
+     * says how many monitored projects that left out.
+     *
+     * @return array{projects: list<array<string, mixed>>, series: list<array<string, mixed>>, omitted: int}
+     */
+    public function getUptimeSeries(ProjectContext $project, ?string $period = null, ?string $from = null, ?string $to = null): array
+    {
+        return $this->cache->remember(
+            'uptime-series',
+            $this->cacheContext($project, $period, $from, $to),
+            fn () => $this->readUptimeSeries($project, $period, $from, $to),
+        );
+    }
+
+    /**
+     * @return array{projects: list<array<string, mixed>>, series: list<array<string, mixed>>, omitted: int}
+     */
+    private function readUptimeSeries(ProjectContext $project, ?string $period, ?string $from, ?string $to): array
+    {
+        $period = $period ?: '1h';
+
+        $monitored = Project::query()
+            ->whereIn('id', $project->projectIds())
+            ->withUptimeMonitoring()
+            ->get(['id', 'name', 'slug', 'last_uptime_status']);
+
+        if ($monitored->isEmpty()) {
+            return ['projects' => [], 'series' => [], 'omitted' => 0];
+        }
+
+        $slot = $this->timeSlotSql($period, 'checked_at');
+
+        $rows = UptimeCheck::query()
+            ->whereIn('project_id', $monitored->modelKeys())
+            ->forPeriod($period, $from, $to)
+            ->select([
+                'project_id',
+                DB::raw("{$slot} as slot"),
+                DB::raw('COUNT(*) as total'),
+                DB::raw('SUM(CASE WHEN '.$this->col('status')." = 'up' THEN 1 ELSE 0 END) as up_count"),
+                DB::raw('SUM('.$this->col('response_time').') as sum_response_time'),
+                DB::raw('COUNT('.$this->col('response_time').') as response_count'),
+            ])
+            ->groupBy('project_id', 'slot')
+            ->toBase()
+            ->get();
+
+        $bySlot = [];
+        $totals = [];
+
+        foreach ($rows as $row) {
+            $id = (int) $row->project_id;
+            $total = (int) $row->total;
+            $up = (int) $row->up_count;
+
+            $bySlot[(string) $row->slot][$id] = [
+                'uptime' => $total > 0 ? round(($up / $total) * 100, 2) : null,
+                'response' => (int) $row->response_count > 0
+                    ? (int) round((float) $row->sum_response_time / (int) $row->response_count)
+                    : null,
+            ];
+
+            $carried = $totals[$id] ?? ['total' => 0, 'up' => 0, 'sum_response' => 0.0, 'response_count' => 0];
+
+            $totals[$id] = [
+                'total' => $carried['total'] + $total,
+                'up' => $carried['up'] + $up,
+                'sum_response' => $carried['sum_response'] + (float) $row->sum_response_time,
+                'response_count' => $carried['response_count'] + (int) $row->response_count,
+            ];
+        }
+
+        // Least available first: the applications worth looking at are the
+        // ones that went down, and they are the ones that survive the cap.
+        $charted = $monitored
+            ->filter(fn (Project $candidate) => isset($totals[$candidate->id]))
+            ->sortBy([
+                fn (Project $a, Project $b) => $this->uptimePercentage($totals[$a->id]) <=> $this->uptimePercentage($totals[$b->id]),
+                fn (Project $a, Project $b) => strcasecmp($a->name, $b->name),
+            ])
+            ->take(self::UPTIME_SERIES_LIMIT)
+            ->values();
+
+        $keys = $period === 'custom'
+            ? $this->customRangeKeys($from, $to)
+            : $this->periodKeys($period);
+
+        $series = array_map(function (string $key) use ($bySlot, $charted): array {
+            $point = ['minute' => $key];
+
+            foreach ($charted as $candidate) {
+                $values = $bySlot[$key][$candidate->id] ?? null;
+
+                // A slot a project recorded no check in stays absent rather
+                // than reading as 0% availability; the chart bridges the gap.
+                if ($values === null) {
+                    continue;
+                }
+
+                $point['uptime_'.$candidate->id] = $values['uptime'];
+                $point['response_'.$candidate->id] = $values['response'];
+            }
+
+            return $point;
+        }, $keys);
+
+        return [
+            'projects' => $charted->map(fn (Project $candidate) => [
+                'id' => $candidate->id,
+                'name' => $candidate->name,
+                'slug' => $candidate->slug,
+                'status' => $candidate->last_uptime_status ?? 'unknown',
+                'uptime' => $this->uptimePercentage($totals[$candidate->id]),
+                'checks' => $totals[$candidate->id]['total'],
+                'down' => $totals[$candidate->id]['total'] - $totals[$candidate->id]['up'],
+                'avg_response_time' => $totals[$candidate->id]['response_count'] > 0
+                    ? (int) round($totals[$candidate->id]['sum_response'] / $totals[$candidate->id]['response_count'])
+                    : null,
+            ])->all(),
+            'series' => $series,
+            'omitted' => max($monitored->count() - $charted->count(), 0),
+        ];
+    }
+
+    /**
+     * @param  array{total: int, up: int}  $totals
+     */
+    private function uptimePercentage(array $totals): float
+    {
+        return $totals['total'] > 0
+            ? round(($totals['up'] / $totals['total']) * 100, 2)
+            : 100.0;
     }
 
     public function getSecurityHistoryByHash(ProjectContext $project, string $hash, ?string $period = '24h', ?string $from = null, ?string $to = null): array

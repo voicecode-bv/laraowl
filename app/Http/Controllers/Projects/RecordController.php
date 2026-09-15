@@ -68,15 +68,16 @@ class RecordController extends Controller
      * Specialized Domain Renderers
      */
     /**
-     * The dashboard renders in three parts.
+     * The dashboard renders in four parts.
      *
      * The cards come from one grouped read and are answered straight away;
-     * the charts and the user panels are deferred, so the screen paints
-     * before either has been queried. Each part resolves through a memoised
-     * closure, which keeps two things true: a part nobody asked for costs
-     * nothing (a deferred follow-up requests only its own group, so the
-     * others are never resolved), and the two props inside a group share the
-     * single read that produced them.
+     * the charts, the per-application availability series and the user
+     * panels are deferred, so the screen paints before any of them has been
+     * queried. Each part resolves through a memoised closure, which keeps
+     * two things true: a part nobody asked for costs nothing (a deferred
+     * follow-up requests only its own group, so the others are never
+     * resolved), and the two props inside a group share the single read that
+     * produced them.
      */
     protected function renderDashboardIndex(ProjectContext $project, string $period, ?string $from, ?string $to): Response
     {
@@ -97,6 +98,11 @@ class RecordController extends Controller
             ]),
             'timeSeries' => Inertia::defer(fn () => $charts()['timeSeries'], 'charts'),
             'exceptionTimeSeries' => Inertia::defer(fn () => $charts()['exceptionTimeSeries'], 'charts'),
+            // Only the "All" scope charts availability per application, so a
+            // single-project dashboard does not even announce the group.
+            ...($project->isAggregate() ? [
+                'uptime_series' => Inertia::defer(fn () => $this->recordService->getUptimeSeries($project, $period, $from, $to), 'uptime'),
+            ] : []),
             'impacted_users' => Inertia::defer(fn () => $panels()['impacted_users'], 'panels'),
             'active_users' => Inertia::defer(fn () => $panels()['active_users'], 'panels'),
             'period' => $period,
