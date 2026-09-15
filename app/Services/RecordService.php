@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Concerns\BuildsRollupQueries;
+use App\Events\ProjectUptimeChanged;
 use App\Models\Issue;
 use App\Models\Project;
 use App\Models\Record;
@@ -33,11 +34,12 @@ class RecordService
     use BuildsRollupQueries;
 
     /**
-     * How many applications the aggregate uptime chart draws a line for.
+     * How many applications the aggregate uptime chart draws a band for.
      *
-     * Bounded by the categorical palette: eight hues that stay apart from one
-     * another, colour-vision deficiencies included. A ninth line would have to
-     * reuse a hue, which is worse than leaving it off the chart.
+     * Bounded by vertical space rather than by colour: the chart gives each
+     * application its own timeline row, so a ninth costs another band on the
+     * card, not another hue to tell apart. Eight rows already fill the card
+     * the dashboard gives it; the rest are reported as `omitted`.
      */
     private const UPTIME_SERIES_LIMIT = 8;
 
@@ -191,6 +193,7 @@ class RecordService
                     'up' => $project->last_uptime_status === 'up' ? 1 : 0,
                     'down' => $project->last_uptime_status === 'down' ? 1 : 0,
                     'total' => 1,
+                    'offline' => $this->offlineProjects(collect([$project])),
                 ],
         ];
     }
@@ -261,7 +264,7 @@ class RecordService
     {
         $projects = Project::query()
             ->whereIn('id', $project->projectIds())
-            ->get(['last_uptime_status', 'last_uptime_check_at']);
+            ->get(['id', 'name', 'slug', 'url', 'last_uptime_status', 'last_uptime_check_at']);
 
         $up = $projects->where('last_uptime_status', 'up')->count();
         $down = $projects->where('last_uptime_status', 'down')->count();
@@ -275,7 +278,34 @@ class RecordService
             'up' => $up,
             'down' => $down,
             'total' => $total,
+            'offline' => $this->offlineProjects($projects),
         ];
+    }
+
+    /**
+     * The applications that are down right now, named.
+     *
+     * The dashboard's alert is driven by {@see ProjectUptimeChanged}
+     * once the page is open, but a page opened *during* an outage has no
+     * transition to hear — this is the state the banner starts from, so it is
+     * right on arrival and not only from the next change onwards.
+     *
+     * @param  Collection<int, Project>  $projects
+     * @return list<array<string, mixed>>
+     */
+    private function offlineProjects(Collection $projects): array
+    {
+        return $projects
+            ->where('last_uptime_status', 'down')
+            ->map(fn (Project $offline): array => [
+                'id' => $offline->id,
+                'name' => $offline->name,
+                'slug' => $offline->slug,
+                'url' => $offline->url,
+                'since' => $offline->last_uptime_check_at?->toIso8601String(),
+            ])
+            ->values()
+            ->all();
     }
 
     /**
@@ -1375,10 +1405,12 @@ class RecordService
      * rather than 1440, and the period totals under the plot are folded out
      * of those same rows instead of costing a second aggregate.
      *
-     * `series` carries the failed checks per slot, and carries them only
-     * where there were any: an application that stayed up contributes no keys
-     * at all, which is what keeps a payload covering a quiet month small.
-     * The availability the legend reports lives in `projects`.
+     * `series` carries a slot's check count for every application that was
+     * measured in it, and its failure count only where something failed — so
+     * a quiet month is one small integer per slot and an unmonitored stretch
+     * is the absence of even that, which is how the chart tells a clean run
+     * apart from a gap in the monitoring. The availability each band reports
+     * lives in `projects`.
      *
      * Only monitored projects are read, and only the
      * {@see self::UPTIME_SERIES_LIMIT} least available of them are charted —
@@ -1473,15 +1505,21 @@ class RecordService
             foreach ($charted as $candidate) {
                 $values = $bySlot[$key][$candidate->id] ?? null;
 
-                // A slot an application came through clean carries no keys:
-                // it has no bar segment to draw and nothing to say in the
-                // tooltip, and most slots of most periods are that slot.
-                if ($values === null || $values['failed'] === 0) {
+                // A slot nothing was measured in carries no keys at all, and
+                // the chart draws it as a gap rather than as health: "we were
+                // not looking" and "nothing was wrong" are different answers,
+                // and a status band shows the difference. A slot that was
+                // measured and came through clean carries only its check
+                // count, which is what keeps a quiet period's payload small.
+                if ($values === null || $values['checks'] === 0) {
                     continue;
                 }
 
-                $point['failed_'.$candidate->id] = $values['failed'];
                 $point['checks_'.$candidate->id] = $values['checks'];
+
+                if ($values['failed'] > 0) {
+                    $point['failed_'.$candidate->id] = $values['failed'];
+                }
             }
 
             return $point;

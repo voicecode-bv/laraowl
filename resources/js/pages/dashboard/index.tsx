@@ -23,8 +23,10 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
+import { UptimeAlertBanner } from '@/components/uptime-alert-banner';
 import { UptimeChart } from '@/components/uptime-chart';
 import { useLiveReload } from '@/hooks/use-live-reload';
+import { useUptimeAlerts } from '@/hooks/use-uptime-alerts';
 import AppLayout from '@/layouts/app-layout';
 import { appendMonitoringQuery } from '@/lib/monitoring-query';
 import { formatMicroSeconds, formatCompactNumber } from '@/lib/utils';
@@ -97,6 +99,14 @@ export default function Dashboard({
 
     useLiveReload(currentProject?.id);
 
+    // Driven by the team channel rather than the project one, so the "All"
+    // scope hears about any application without holding a subscription open
+    // per project.
+    const offline = useUptimeAlerts(
+        currentProject?.team_id ?? props.currentTeam?.id,
+        uptime_status?.offline,
+    );
+
     const exceptionSeries = exceptionTimeSeries?.slice(-20) || [];
     const maxExceptionCount = exceptionSeries.reduce(
         (max: number, d: any) => Math.max(max, d.total || 0),
@@ -108,6 +118,11 @@ export default function Dashboard({
             <Head title={`Dashboard - ${currentProject?.name}`} />
 
             <div className="animate-in space-y-12 duration-700 fade-in">
+                <UptimeAlertBanner
+                    offline={offline}
+                    uptimeHref={monitoringHref('uptime')}
+                />
+
                 {/* Section: Health & Setup */}
                 <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
                     {/* Uptime Status */}

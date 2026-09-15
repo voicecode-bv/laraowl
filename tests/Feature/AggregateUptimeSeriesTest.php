@@ -197,3 +197,53 @@ test('the aggregate dashboard defers the series, and a single project never asks
             ->loadDeferredProps(fn ($reload) => $reload->missing('uptime_series'))
         );
 });
+
+test('a measured slot reports its check count even when nothing failed', function () {
+    [$team] = uptimeTeam();
+
+    $project = Project::factory()->create([
+        'team_id' => $team->id,
+        'name' => 'Steady',
+        'last_uptime_status' => 'up',
+    ]);
+
+    $project->uptimeChecks()->createMany([
+        ['status' => 'up', 'response_time' => 100, 'status_code' => 200, 'checked_at' => now()->subMinutes(2)],
+        ['status' => 'up', 'response_time' => 120, 'status_code' => 200, 'checked_at' => now()->subMinutes(2)],
+    ]);
+
+    $series = app(RecordService::class)->getUptimeSeries(new TeamProjectScope($team), '1h');
+
+    $measured = collect($series['series'])->filter(
+        fn (array $slot) => isset($slot["checks_{$project->id}"]),
+    );
+
+    // The band needs "we looked and it was fine" to be distinguishable from
+    // "we were not looking": a clean slot carries its count and no failures.
+    expect($measured)->toHaveCount(1)
+        ->and($measured->first()["checks_{$project->id}"])->toBe(2)
+        ->and($measured->first())->not->toHaveKey("failed_{$project->id}");
+});
+
+test('a slot nothing was measured in carries no keys at all', function () {
+    [$team] = uptimeTeam();
+
+    $project = Project::factory()->create([
+        'team_id' => $team->id,
+        'name' => 'Gappy',
+        'last_uptime_status' => 'up',
+    ]);
+
+    $project->uptimeChecks()->create([
+        'status' => 'up', 'response_time' => 100, 'status_code' => 200, 'checked_at' => now()->subMinutes(2),
+    ]);
+
+    $series = app(RecordService::class)->getUptimeSeries(new TeamProjectScope($team), '1h');
+
+    $untouched = collect($series['series'])->reject(
+        fn (array $slot) => isset($slot["checks_{$project->id}"]),
+    );
+
+    expect($untouched)->not->toBeEmpty()
+        ->and($untouched->every(fn (array $slot) => ! isset($slot["failed_{$project->id}"])))->toBeTrue();
+});

@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Events\ProjectUptimeChanged;
 use App\Models\Heartbeat;
 use App\Models\Project;
 use App\Services\AlertService;
@@ -116,12 +117,14 @@ class CheckProjectUptime extends Command
         if ($status === 'down' && $previousStatus !== 'down') {
             $this->warn("Project {$project->name} is DOWN!");
             $alertService->notifyUptimeDown($project, $statusCode, $error);
+            ProjectUptimeChanged::dispatch($project, 'down', $statusCode, $error);
         }
 
         // Trigger Alert if status recovered to 'up'
         if ($status === 'up' && $previousStatus === 'down') {
             $this->info("Project {$project->name} is back UP.");
             $this->notifyRecovery($project, $alertService);
+            ProjectUptimeChanged::dispatch($project, 'up', $statusCode);
         }
     }
 

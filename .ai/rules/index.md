@@ -4,5 +4,5 @@ Before planning or editing, find the row whose globs match the file's path and r
 
 | Applies to | Rule file |
 | --- | --- |
-| resources/js/components/uptime-chart.tsx | .ai/rules/components.md |
+| resources/js/components/uptime-chart.tsx, resources/js/components/uptime-alert-banner.tsx, resources/js/hooks/use-uptime-alerts.ts | .ai/rules/components.md |
 | app/Services/Roll*.php, app/Services/RecordService.php | .ai/rules/services.md |
