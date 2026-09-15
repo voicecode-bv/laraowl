@@ -1285,16 +1285,21 @@ class RecordService
      * Per-application availability over the selected period, for the chart
      * the "All" scope renders on the dashboard.
      *
-     * One grouped read over `uptime_checks` answers every line on the chart:
-     * the rows come back already floored onto the chart's own slot grid
-     * ({@see timeSlotSql()}), so a day of per-minute checks is 96 rows per
-     * project rather than 1440, and the period totals under the legend are
-     * folded out of those same rows instead of costing a second aggregate.
+     * One grouped read over `uptime_checks` answers the whole chart: the rows
+     * come back already floored onto the chart's own slot grid ({@see
+     * timeSlotSql()}), so a day of per-minute checks is 96 rows per project
+     * rather than 1440, and the period totals under the plot are folded out
+     * of those same rows instead of costing a second aggregate.
+     *
+     * `series` carries the failed checks per slot, and carries them only
+     * where there were any: an application that stayed up contributes no keys
+     * at all, which is what keeps a payload covering a quiet month small.
+     * The availability the legend reports lives in `projects`.
      *
      * Only monitored projects are read, and only the
      * {@see self::UPTIME_SERIES_LIMIT} least available of them are charted —
-     * past that the lines run out of colours to be told apart by. `omitted`
-     * says how many monitored projects that left out.
+     * past that the stacked segments run out of colours to be told apart by.
+     * `omitted` says how many monitored projects that left out.
      *
      * @return array{projects: list<array<string, mixed>>, series: list<array<string, mixed>>, omitted: int}
      */
@@ -1349,10 +1354,8 @@ class RecordService
             $up = (int) $row->up_count;
 
             $bySlot[(string) $row->slot][$id] = [
-                'uptime' => $total > 0 ? round(($up / $total) * 100, 2) : null,
-                'response' => (int) $row->response_count > 0
-                    ? (int) round((float) $row->sum_response_time / (int) $row->response_count)
-                    : null,
+                'failed' => $total - $up,
+                'checks' => $total,
             ];
 
             $carried = $totals[$id] ?? ['total' => 0, 'up' => 0, 'sum_response' => 0.0, 'response_count' => 0];
@@ -1386,14 +1389,15 @@ class RecordService
             foreach ($charted as $candidate) {
                 $values = $bySlot[$key][$candidate->id] ?? null;
 
-                // A slot a project recorded no check in stays absent rather
-                // than reading as 0% availability; the chart bridges the gap.
-                if ($values === null) {
+                // A slot an application came through clean carries no keys:
+                // it has no bar segment to draw and nothing to say in the
+                // tooltip, and most slots of most periods are that slot.
+                if ($values === null || $values['failed'] === 0) {
                     continue;
                 }
 
-                $point['uptime_'.$candidate->id] = $values['uptime'];
-                $point['response_'.$candidate->id] = $values['response'];
+                $point['failed_'.$candidate->id] = $values['failed'];
+                $point['checks_'.$candidate->id] = $values['checks'];
             }
 
             return $point;

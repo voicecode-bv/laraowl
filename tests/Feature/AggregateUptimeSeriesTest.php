@@ -21,7 +21,7 @@ function uptimeTeam(): array
     return [$team, $user];
 }
 
-test('the series carries one line per monitored application with its availability', function () {
+test('the legend carries one application per monitored project with its availability', function () {
     [$team] = uptimeTeam();
 
     $healthy = Project::factory()->create(['team_id' => $team->id, 'name' => 'Healthy', 'last_uptime_status' => 'up']);
@@ -41,6 +41,7 @@ test('the series carries one line per monitored application with its availabilit
 
     // Least available first, so the application worth looking at leads.
     expect($series['projects'])->toHaveCount(2)
+        ->and($series['projects'][0]['checks'])->toBe(2)
         ->and($series['projects'][0]['name'])->toBe('Flaky')
         ->and($series['projects'][0]['uptime'])->toBe(50.0)
         ->and($series['projects'][0]['down'])->toBe(1)
@@ -52,26 +53,28 @@ test('the series carries one line per monitored application with its availabilit
         ->and($series['omitted'])->toBe(0);
 });
 
-test('the series spans the whole period, and a slot without a check stays absent', function () {
+test('the series spans the whole period, and only the failed slots carry a bar', function () {
     [$team] = uptimeTeam();
 
     $project = Project::factory()->create(['team_id' => $team->id]);
-    $project->uptimeChecks()->create([
-        'status' => 'down', 'response_time' => null, 'status_code' => 503, 'checked_at' => now()->subMinutes(3),
+    $project->uptimeChecks()->createMany([
+        ['status' => 'down', 'response_time' => null, 'status_code' => 503, 'checked_at' => now()->subMinutes(3)],
+        ['status' => 'up', 'response_time' => 80, 'status_code' => 200, 'checked_at' => now()->subMinutes(2)],
     ]);
 
     $series = app(RecordService::class)->getUptimeSeries(new TeamProjectScope($team), '1h');
 
-    // One slot per minute of the hour, gaps included, so the chart keeps its
-    // x-axis instead of collapsing onto the single minute that has data.
+    // One slot per minute of the hour, quiet ones included, so the chart
+    // keeps its x-axis instead of collapsing onto the single failed minute.
     expect($series['series'])->toHaveCount(60);
 
-    $withData = collect($series['series'])->filter(fn (array $slot) => array_key_exists('uptime_'.$project->id, $slot));
+    $withBars = collect($series['series'])->filter(fn (array $slot) => array_key_exists('failed_'.$project->id, $slot));
 
-    expect($withData)->toHaveCount(1)
-        ->and($withData->first()['uptime_'.$project->id])->toBe(0.0)
-        // A check that never answered carries no response time to average.
-        ->and($withData->first()['response_'.$project->id])->toBeNull();
+    // The minute that came through clean carries no keys at all, which is
+    // what keeps a quiet period's payload small.
+    expect($withBars)->toHaveCount(1)
+        ->and($withBars->first()['failed_'.$project->id])->toBe(1)
+        ->and($withBars->first()['checks_'.$project->id])->toBe(1);
 });
 
 test('the day view folds the checks onto the chart grid instead of one slot per minute', function () {
@@ -88,12 +91,15 @@ test('the day view folds the checks onto the chart grid instead of one slot per 
 
     $series = app(RecordService::class)->getUptimeSeries(new TeamProjectScope($team), '24h');
 
-    $withData = collect($series['series'])->filter(fn (array $slot) => array_key_exists('uptime_'.$project->id, $slot));
+    $withBars = collect($series['series'])->filter(fn (array $slot) => array_key_exists('failed_'.$project->id, $slot));
 
     expect($series['series'])->toHaveCount(96)
-        ->and($withData)->toHaveCount(1)
-        ->and($withData->first()['uptime_'.$project->id])->toBe(66.67)
-        ->and($withData->first()['response_'.$project->id])->toBe(150);
+        ->and($withBars)->toHaveCount(1)
+        ->and($withBars->first()['failed_'.$project->id])->toBe(1)
+        // The bar is one failure out of the three checks the slot folded in.
+        ->and($withBars->first()['checks_'.$project->id])->toBe(3)
+        ->and($series['projects'][0]['uptime'])->toBe(66.67)
+        ->and($series['projects'][0]['avg_response_time'])->toBe(150);
 });
 
 test('only monitored applications are charted, and the chart is capped', function () {

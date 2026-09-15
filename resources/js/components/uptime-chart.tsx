@@ -1,9 +1,9 @@
-import { Globe } from 'lucide-react';
+import { CheckCircle2, Globe } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import {
+    Bar,
+    BarChart,
     CartesianGrid,
-    Line,
-    LineChart,
     ResponsiveContainer,
     Tooltip,
     XAxis,
@@ -13,10 +13,10 @@ import { cn } from '@/lib/utils';
 
 /**
  * Categorical series colours, stepped for the dark surface the app renders on
- * and assigned in this fixed order: the ordering is what keeps adjacent lines
- * apart for colour-vision deficiencies, so a line takes the next free slot
- * rather than a hue of its own. There are eight, which is why the server caps
- * the chart at eight applications.
+ * and assigned in this fixed order: the ordering is what keeps stacked
+ * segments apart for colour-vision deficiencies, so an application takes the
+ * next free slot rather than a hue of its own. There are eight, which is why
+ * the server caps the chart at eight applications.
  */
 const SERIES_COLORS = [
     '#3987e5',
@@ -55,12 +55,14 @@ function formatUptime(value: number): string {
 }
 
 /**
- * Availability per application over the selected period.
+ * Failed uptime checks over the selected period, stacked per application.
  *
- * Every line is one application, and the legend below the plot doubles as the
- * control for it: clicking an application takes its line off the chart, so a
- * single outage can be read on its own without the healthy lines stacked on
- * top of it at 100%.
+ * Availability charted directly is a flat line at 100% that nobody reads, so
+ * the plot draws the exception instead: a bar rises only where a check
+ * failed, and its segments say which applications were behind it. The legend
+ * underneath carries the availability each application actually reached, and
+ * doubles as the control for the plot — clicking an application takes its
+ * segments out of the stack.
  */
 export function UptimeChart({
     series,
@@ -80,6 +82,22 @@ export function UptimeChart({
 
         return colors;
     }, [series.projects]);
+
+    const visible = series.projects.filter(
+        (project) => !hidden.includes(project.id),
+    );
+
+    // Every slot is on the x-axis whether or not anything failed in it, so an
+    // empty plot means "nothing went down", not "nothing was measured".
+    const hasFailures = useMemo(
+        () =>
+            series.series.some((slot) =>
+                visible.some(
+                    (project) => slot[`failed_${project.id}`] !== undefined,
+                ),
+            ),
+        [series.series, visible],
+    );
 
     if (series.projects.length === 0) {
         return (
@@ -103,17 +121,13 @@ export function UptimeChart({
         );
     };
 
-    const visible = series.projects.filter(
-        (project) => !hidden.includes(project.id),
-    );
-
     return (
         <div className="space-y-6">
-            <div className="h-[280px] w-full">
+            <div className="relative h-[280px] w-full">
                 <ResponsiveContainer width="100%" height="100%">
-                    <LineChart
+                    <BarChart
                         data={series.series}
-                        margin={{ top: 8, right: 8, bottom: 0, left: -16 }}
+                        margin={{ top: 8, right: 8, bottom: 0, left: -20 }}
                     >
                         <CartesianGrid
                             vertical={false}
@@ -129,112 +143,113 @@ export function UptimeChart({
                             className="text-muted-foreground/60"
                         />
                         <YAxis
-                            domain={[0, 100]}
-                            ticks={[0, 50, 100]}
+                            allowDecimals={false}
                             tickLine={false}
                             axisLine={false}
-                            width={48}
-                            tickFormatter={(value: number) => `${value}%`}
+                            width={44}
                             tick={{ fontSize: 9, fill: 'currentColor' }}
                             className="text-muted-foreground/60"
                         />
                         <Tooltip
-                            cursor={{
-                                stroke: 'currentColor',
-                                strokeOpacity: 0.2,
-                            }}
+                            cursor={{ fill: 'currentColor', fillOpacity: 0.06 }}
                             content={({ active, payload, label }) => {
-                                if (!active || !payload?.length) {
+                                if (!active) {
                                     return null;
                                 }
 
-                                const slot = payload[0].payload ?? {};
+                                // A slot where nothing failed has no bar to
+                                // hand over its row, so it is looked up by
+                                // its label instead of skipped.
+                                const slot =
+                                    payload?.[0]?.payload ??
+                                    series.series.find(
+                                        (point) => point.minute === label,
+                                    ) ??
+                                    {};
                                 const rows = visible
                                     .map((project) => ({
                                         project,
-                                        uptime: slot[`uptime_${project.id}`],
-                                        response:
-                                            slot[`response_${project.id}`],
+                                        failed: slot[`failed_${project.id}`],
+                                        checks: slot[`checks_${project.id}`],
                                     }))
-                                    .filter(
-                                        (row) =>
-                                            row.uptime !== undefined &&
-                                            row.uptime !== null,
-                                    )
+                                    .filter((row) => row.failed !== undefined)
                                     .sort(
                                         (a, b) =>
-                                            (a.uptime as number) -
-                                            (b.uptime as number),
+                                            (b.failed as number) -
+                                            (a.failed as number),
                                     );
-
-                                if (rows.length === 0) {
-                                    return null;
-                                }
 
                                 return (
                                     <div className="rounded-lg border border-border bg-background/95 p-2 shadow-xl backdrop-blur-sm">
                                         <div className="mb-1.5 border-b border-border/50 pb-1 text-[9px] font-bold tracking-tight text-muted-foreground uppercase">
                                             {label}
                                         </div>
-                                        <div className="grid gap-1">
-                                            {rows.map((row) => (
-                                                <div
-                                                    key={row.project.id}
-                                                    className="flex items-center gap-2"
-                                                >
+                                        {rows.length === 0 ? (
+                                            <div className="text-[10px] font-bold text-emerald-500 uppercase">
+                                                All checks passed
+                                            </div>
+                                        ) : (
+                                            <div className="grid gap-1">
+                                                {rows.map((row) => (
                                                     <div
-                                                        className="size-2 shrink-0 rounded-full"
-                                                        style={{
-                                                            backgroundColor:
-                                                                colorFor.get(
-                                                                    row.project
-                                                                        .id,
-                                                                ),
-                                                        }}
-                                                    />
-                                                    <span className="max-w-[140px] truncate text-[10px] font-medium text-muted-foreground uppercase">
-                                                        {row.project.name}
-                                                    </span>
-                                                    <span className="ml-auto text-[10px] font-bold text-foreground">
-                                                        {formatUptime(
-                                                            row.uptime as number,
-                                                        )}
-                                                    </span>
-                                                    {row.response !== null &&
-                                                        row.response !==
-                                                            undefined && (
-                                                            <span className="text-[10px] font-medium text-muted-foreground/60">
-                                                                {row.response}ms
-                                                            </span>
-                                                        )}
-                                                </div>
-                                            ))}
-                                        </div>
+                                                        key={row.project.id}
+                                                        className="flex items-center gap-2"
+                                                    >
+                                                        <div
+                                                            className="size-2 shrink-0 rounded-full"
+                                                            style={{
+                                                                backgroundColor:
+                                                                    colorFor.get(
+                                                                        row
+                                                                            .project
+                                                                            .id,
+                                                                    ),
+                                                            }}
+                                                        />
+                                                        <span className="max-w-[140px] truncate text-[10px] font-medium text-muted-foreground uppercase">
+                                                            {row.project.name}
+                                                        </span>
+                                                        <span className="ml-auto text-[10px] font-bold text-foreground">
+                                                            {
+                                                                row.failed as number
+                                                            }{' '}
+                                                            of{' '}
+                                                            {
+                                                                row.checks as number
+                                                            }{' '}
+                                                            failed
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
                                     </div>
                                 );
                             }}
                         />
                         {series.projects.map((project) => (
-                            <Line
+                            <Bar
                                 key={project.id}
-                                type="monotone"
-                                dataKey={`uptime_${project.id}`}
+                                dataKey={`failed_${project.id}`}
                                 name={project.name}
-                                stroke={colorFor.get(project.id)}
-                                strokeWidth={2}
-                                dot={false}
-                                activeDot={{ r: 4, strokeWidth: 0 }}
+                                fill={colorFor.get(project.id)}
+                                stackId="failed"
+                                radius={[2, 2, 0, 0]}
                                 isAnimationActive={false}
                                 hide={hidden.includes(project.id)}
-                                // An application checked every few minutes
-                                // leaves most slots of the hour view empty;
-                                // without this its line would have no segment
-                                // to draw at all.
-                                connectNulls
                             />
                         ))}
-                    </LineChart>
+                    </BarChart>
                 </ResponsiveContainer>
+
+                {!hasFailures && (
+                    <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2">
+                        <CheckCircle2 className="size-8 text-emerald-500/40" />
+                        <div className="text-[10px] font-black tracking-widest text-muted-foreground uppercase opacity-60">
+                            No failed checks in the last {period}
+                        </div>
+                    </div>
+                )}
             </div>
 
             <div className="flex flex-wrap gap-2">
@@ -278,9 +293,9 @@ export function UptimeChart({
                             >
                                 {formatUptime(project.uptime)}
                             </span>
-                            {project.avg_response_time !== null && (
+                            {project.down > 0 && (
                                 <span className="text-[10px] font-medium text-muted-foreground/60">
-                                    {project.avg_response_time}ms
+                                    {project.down} failed
                                 </span>
                             )}
                         </button>
@@ -290,8 +305,8 @@ export function UptimeChart({
 
             <div className="text-[10px] font-black tracking-widest text-muted-foreground uppercase opacity-50">
                 {series.omitted > 0
-                    ? `Least available ${series.projects.length} of ${series.projects.length + series.omitted} monitored applications · last ${period}`
-                    : `Availability per application · last ${period}`}
+                    ? `Failed checks · least available ${series.projects.length} of ${series.projects.length + series.omitted} monitored applications · last ${period}`
+                    : `Failed checks per application · last ${period}`}
             </div>
         </div>
     );
